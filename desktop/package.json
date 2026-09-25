@@ -10,14 +10,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "start": "electron .",
-    "smoke": "electron . --smoke",
     "package:dir": "electron-builder --dir",
-    "package": "electron-builder --win nsis portable",
-    "test:journal": "node --experimental-strip-types --test tests/journalPresentation.test.mjs",
-    "test:search": "node --experimental-strip-types --test tests/searchPresentation.test.mjs",
-    "test:writing": "node --test tests/officeCitation.test.cjs tests/officeBridge.test.cjs",
-    "test:browser": "node --test tests/browserExtension.test.cjs",
-    "test:main": "node --test tests/mainProcess.test.cjs"
+    "package": "electron-builder --win nsis portable"
   },
   "dependencies": {
     "@citation-js/core": "0.9.0",
@@ -54,6 +48,8 @@
     "files": [
       "dist/**",
       "electron/**",
+      "!electron/*-smoke.cjs",
+      "!electron/smoke.cjs",
       "package.json"
     ],
     "extraResources": [

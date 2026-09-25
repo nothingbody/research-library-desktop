@@ -9,7 +9,13 @@
 /.workbuddy/
 /desktop/node_modules/
 /desktop/dist/
-/desktop/tests/fixtures/journals.json
+
+# Keep local test suites and Electron acceptance scripts out of the public repository.
+/tests_client/
+/test_*.py
+/desktop/tests/
+/desktop/electron/*-smoke.cjs
+/desktop/electron/smoke.cjs
 /docs/*
 !/docs/使用指南.md
 !/docs/开发指南.md

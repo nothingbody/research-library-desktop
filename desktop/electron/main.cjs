@@ -15,12 +15,9 @@ csl.styles.add('gb-t-7714-2015', fs.readFileSync(path.join(__dirname,'csl/gb-t-7
 const styleOptions = [{id:'apa',name:'APA'},{id:'vancouver',name:'Vancouver'},{id:'harvard1',name:'Harvard'},{id:'gb-t-7714-2015',name:'GB/T 7714—2015（顺序编码）'}];
 
 protocol.registerSchemesAsPrivileged([{scheme: 'app', privileges: {standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true}}]);
-const project = process.env.RESEARCH_QA_PROJECT || path.resolve(__dirname, '../..');
-const smoke = process.argv.includes('--smoke');
+const project = path.resolve(__dirname, '../..');
 const launcherScheme = 'researchlibrary';
-if (smoke) app.commandLine.appendSwitch('force-device-scale-factor', '1');
-if (smoke && process.env.RESEARCH_QA_OUT) {const qaProfile=path.join(process.env.RESEARCH_QA_OUT, 'profile'); fs.mkdirSync(qaProfile,{recursive:true}); app.setPath('userData',qaProfile);}
-mainLog.install(app.getPath('userData'), {captureConsole: !smoke});
+mainLog.install(app.getPath('userData'), {captureConsole: true});
 let win, child, closing = false, sequence = 0, readyPromise, root, configPath, config = {}, officeBridge;
 const pending = new Map();
 const allowed = new Set(('app.info library.stats library.reindex items.list items.get items.create items.update items.bulk items.duplicates items.merge items.undoMerge collections.list collections.edit notes.list notes.save notes.history notes.delete attachments.get attachments.position attachments.download attachments.setRole annotations.list annotations.save annotations.delete annotations.excerpt annotations.search annotations.exportText reading.get reading.save reading.activity terms.list terms.save terms.delete assistant.status assistant.settings assistant.test assistant.run assistant.runs assistant.translation.page assistant.apply aiSearch.create aiSearch.list aiSearch.get aiSearch.savePlan aiSearch.run aiSearch.expand aiSearch.citationExpand aiSearch.citationLinks aiSearch.rerank aiSearch.journalMatch aiSearch.results aiSearch.evidence aiSearch.intro aiSearch.import aiSearch.cancel aiSearch.verify aiSearch.decision searchEvaluation.report searchEvaluation.save relations.profile.get relations.profile.run relations.create relations.list relations.get relations.diff relations.history relations.run relations.results relations.evidence relations.confirm relations.export relations.forItem relations.discover relations.discoveries relations.discoveryProgress relations.discoveryDecide relations.manualList relations.manualAdd relations.manualRemove relations.graphExport imports.commit jobs.list jobs.action journals.stats journals.list journals.get journals.catalog journals.link journals.related journals.ensure journals.index collector.control settings.get settings.save browser.status browser.importDownloaded writing.sessions writing.session writing.session.save writing.event comparison.list comparison.save metadata.lookup metadata.apply export.text fulltext.sources fulltext.add fulltext.obtain researchAsk.create researchAsk.list researchAsk.get researchAsk.send researchAsk.saveClaim projects.create projects.list projects.get projects.archive projects.link smartCollections.save smartCollections.list smartCollections.results').split(' '));
@@ -84,7 +81,6 @@ function startBackend() {
   let resolveReady, rejectReady;
   readyPromise = new Promise((resolve, reject) => {resolveReady = resolve; rejectReady = reject;});
   const backendEnv = {...process.env, PYTHONIOENCODING: 'utf-8'};
-  delete backendEnv.RESEARCH_QA_API_KEY;
   child = spawn(executable, args, {cwd: app.isPackaged ? path.dirname(executable) : project, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: backendEnv});
   const errorLog = fs.createWriteStream(path.join(app.getPath('userData'), 'backend.log'), {flags: 'a'});
   child.stderr.pipe(errorLog);
@@ -160,9 +156,7 @@ async function fileAction(kind, p) {
   if (kind === 'export' || kind === 'annotatedPDF' || kind === 'noteExport' || kind === 'annotationExport' || kind === 'graphExport' || kind === 'graphImageExport') {
     const ext = kind === 'annotatedPDF' ? 'pdf' : kind === 'graphImageExport' ? 'svg' : kind === 'graphExport' ? 'json' : kind === 'annotationExport' ? (p.format === 'json' ? 'json' : 'md') : kind === 'noteExport' ? (p.format === 'html' ? 'html' : 'md') : {bibtex: 'bib', biblatex: 'bib', ris: 'ris', json: 'json'}[p.format];
     if (!ext) throw new Error('导出格式不支持');
-    const picked = smoke && kind === 'graphImageExport' && process.env.RESEARCH_QA_OUT
-      ? {canceled: false, filePath: path.join(process.env.RESEARCH_QA_OUT, 'relation-graph.svg')}
-      : await dialog.showSaveDialog(win, {title: '导出副本', defaultPath: (kind === 'annotatedPDF' ? '批注文献' : kind === 'graphExport' || kind === 'graphImageExport' ? '文献关联图谱' : kind === 'annotationExport' ? '文献批注汇总' : kind === 'noteExport' ? '阅读笔记' : '参考文献') + '.' + ext, filters: [{name: ext.toUpperCase(), extensions: [ext]}]});
+    const picked = await dialog.showSaveDialog(win, {title: '导出副本', defaultPath: (kind === 'annotatedPDF' ? '批注文献' : kind === 'graphExport' || kind === 'graphImageExport' ? '文献关联图谱' : kind === 'annotationExport' ? '文献批注汇总' : kind === 'noteExport' ? '阅读笔记' : '参考文献') + '.' + ext, filters: [{name: ext.toUpperCase(), extensions: [ext]}]});
     if (picked.canceled) return null;
     if (kind === 'annotatedPDF') return rpc('_attachments.export', {id: p.id, path: picked.filePath});
     const text = kind === 'export' ? await rpc('export.text', p) : String(p.text || '');
@@ -230,8 +224,8 @@ async function init() {
   fs.mkdirSync(app.getPath('userData'), {recursive: true});
   configPath = path.join(app.getPath('userData'), 'library-config.json');
   try {config = JSON.parse(fs.readFileSync(configPath, 'utf8'));} catch {}
-  root = process.env.RESEARCH_LIBRARY || config.libraryRoot || (smoke && process.env.RESEARCH_QA_OUT ? path.join(process.env.RESEARCH_QA_OUT, 'library') : app.isPackaged ? path.join(app.getPath('documents'), '文献工作台') : path.join(project, 'library'));
-  if (!smoke && process.env.RESEARCH_LIBRARY) {config.libraryRoot = root; saveConfig();}
+  root = process.env.RESEARCH_LIBRARY || config.libraryRoot || (app.isPackaged ? path.join(app.getPath('documents'), '文献工作台') : path.join(project, 'library'));
+  if (process.env.RESEARCH_LIBRARY) {config.libraryRoot = root; saveConfig();}
   await startBackend();
   await activateAssistantSecret();
   const customStyles=path.join(app.getPath('userData'),'csl');
@@ -300,17 +294,16 @@ async function init() {
     {label: '搜索文献', accelerator: 'CmdOrCtrl+F', click: () => win.webContents.send('backend-event', 'menu.search', {})},
     {type: 'separator'}, {role: 'quit', label: '退出'}]}, {label: '编辑', submenu: [{role: 'undo'}, {role: 'redo'}, {role: 'cut'}, {role: 'copy'}, {role: 'paste'}, {role: 'selectAll'}]}]));
   await win.loadURL('app://local/');
-  if (smoke) await require(process.env.RESEARCH_QA_MODE==='translationLayout' ? './translation-layout-smoke.cjs' : process.env.RESEARCH_QA_MODE==='advancedSearch' ? './advanced-search-smoke.cjs' : process.env.RESEARCH_QA_MODE==='browser' ? './browser-smoke.cjs' : process.env.RESEARCH_QA_MODE==='qiewenReal' ? './qiewen-real-smoke.cjs' : process.env.RESEARCH_QA_MODE==='continuous' ? './continuous-smoke.cjs' : process.env.RESEARCH_QA_MODE==='realPdf' ? './real-pdf-smoke.cjs' : process.env.RESEARCH_QA_MODE==='deepseek' ? './deepseek-smoke.cjs' : process.env.RESEARCH_QA_MODE==='mainError' ? './main-error-smoke.cjs' : process.env.RESEARCH_QA_MODE==='workflow' ? './workflow-smoke.cjs' : process.env.RESEARCH_QA_MODE==='searchV2' ? './search-v2-smoke.cjs' : process.env.RESEARCH_QA_MODE==='journals' ? './journal-smoke.cjs' : process.env.RESEARCH_QA_MODE==='aiSearch' ? './ai-search-smoke.cjs' : process.env.RESEARCH_QA_MODE==='relations' ? './relations-smoke.cjs' : process.env.RESEARCH_QA_MODE==='writing' ? './writing-smoke.cjs' : process.env.RESEARCH_QA_MODE==='comparison' ? './comparison-smoke.cjs' : './smoke.cjs').run({win, rpc, root, project, app});
-  else win.show();
+  win.show();
 }
-if (!app.requestSingleInstanceLock({smoke})) app.quit();
+if (!app.requestSingleInstanceLock()) app.quit();
 else {
   // The browser extension opens this local-only URI if it cannot reach the
   // capture bridge. It contains no citation data or credentials.
-  if (!smoke) app.setAsDefaultProtocolClient(launcherScheme);
+  app.setAsDefaultProtocolClient(launcherScheme);
   app.on('second-instance', () => focusWindow());
   app.on('open-url', (event, url) => {if (url.startsWith(`${launcherScheme}://`)) {event.preventDefault(); focusWindow();}});
-  app.whenReady().then(init).catch(error => {mainLog.write('startup', error); if (smoke) console.error(error); else dialog.showErrorBox('无法启动文献工作台', `${error.message}\n\n日志：${path.join(app.getPath('userData'), 'main.log')}`); app.exit(1);});
+  app.whenReady().then(init).catch(error => {mainLog.write('startup', error); dialog.showErrorBox('无法启动文献工作台', `${error.message}\n\n日志：${path.join(app.getPath('userData'), 'main.log')}`); app.exit(1);});
 }
 app.on('window-all-closed', () => {if (!closing) app.quit();});
 app.on('before-quit', event => {
@@ -321,7 +314,7 @@ app.on('before-quit', event => {
     // keep sending IPC calls during shutdown and can surface broken-pipe logs.
     if (win && !win.isDestroyed()) win.destroy();
     if (child.stdin.writable) child.stdin.end(JSON.stringify({method: '_shutdown'}) + '\n');
-    child.once('exit', () => smoke ? app.exit(process.exitCode || 0) : app.quit());
-    setTimeout(() => {if (child.exitCode === null) child.kill(); smoke ? app.exit(process.exitCode || 0) : app.quit();}, 10000).unref();
+    child.once('exit', () => app.quit());
+    setTimeout(() => {if (child.exitCode === null) child.kill(); app.quit();}, 10000).unref();
   }
 });

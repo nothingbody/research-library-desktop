@@ -53,7 +53,7 @@ Word 写作加载项有独立的本机桥接和一次性配对码，用于让 Wo
 
 “设置 → 允许手动联网查询”关闭后，本地库、已保存附件和笔记仍可使用，依赖外部服务的操作会停止。项目不提供云同步，也不会把个人文献库作为公网 HTTP 服务开放。浏览器扩展和 Word 加载项只通过本机回环接口连接桌面端。
 
-本仓库只包含源码、构建资源和测试用合成样本。请勿将 `library/`、`data/`、`backups/`、凭据、采集会话、个人截图或未经许可的第三方全文加入 Git。期刊源数据和第三方论文 PDF **不随源码或安装包分发**。
+本仓库只包含源码、文档和构建资源，不包含自动化测试代码。请勿将 `library/`、`data/`、`backups/`、凭据、采集会话、个人截图或未经许可的第三方全文加入 Git。期刊源数据和第三方论文 PDF **不随源码或安装包分发**。
 
 ## 从源码构建
 
@@ -65,9 +65,9 @@ cd research-library-desktop
 pwsh -NoProfile -File .\build-desktop.ps1 -InstallDependencies
 ```
 
-脚本会建立 `.venv-client/`、安装锁定依赖、运行测试，并通过 PyInstaller 和 electron-builder 打包。成功后在 `dist/desktop/` 找到 `ResearchLibrary-Setup-<版本>-x64.exe`、`ResearchLibrary-Portable-<版本>-x64.exe` 和 `win-unpacked/`。以后依赖未变化时，可运行 `pwsh -NoProfile -File .\build-desktop.ps1`。**构建不会自动安装**，也不会把本机个人库或期刊数据放进安装包。
+脚本会建立 `.venv-client/`、安装锁定依赖，并通过 PyInstaller 和 electron-builder 打包。成功后在 `dist/desktop/` 找到 `ResearchLibrary-Setup-<版本>-x64.exe`、`ResearchLibrary-Portable-<版本>-x64.exe` 和 `win-unpacked/`。以后依赖未变化时，可运行 `pwsh -NoProfile -File .\build-desktop.ps1`。**构建不会自动安装**，也不会把本机个人库或期刊数据放进安装包。
 
-如需开发运行，先按 [开发指南](docs/开发指南.md) 初始化 Python 与 npm 依赖，再在 `desktop/` 执行 `npm run build` 和 `npm start`。单独的 `npm run dev` 只有前端页面，没有完整的本机 IPC 功能。自动化测试请使用隔离测试库，不要指向自己的个人文献库。
+如需开发运行，先按 [开发指南](docs/开发指南.md) 初始化 Python 与 npm 依赖，再在 `desktop/` 执行 `npm run build` 和 `npm start`。单独的 `npm run dev` 只有前端页面，没有完整的本机 IPC 功能。
 
 ### 项目结构
 
@@ -76,11 +76,10 @@ pwsh -NoProfile -File .\build-desktop.ps1 -InstallDependencies
 | `desktop/src/` | React 界面、PDF 阅读器与交互 |
 | `desktop/electron/` | Electron 主进程、受限 IPC、浏览器扩展与 Word 加载项 |
 | `client_backend/` | Python 本地服务、SQLite、全文索引和联网适配 |
-| `tests_client/`、`desktop/tests/` | 后端、前端与主进程测试 |
 | `docs/` | 使用与开发说明 |
-| `build-desktop.ps1` | 测试和 Windows 打包入口 |
+| `build-desktop.ps1` | Windows 打包入口 |
 
-Electron 渲染进程不具有 Node 权限，主进程通过受限 IPC 与界面通信，并以逐行 JSON 连接 Python 子进程。测试命令和打包细节见 [开发指南](docs/开发指南.md)。
+Electron 渲染进程不具有 Node 权限，主进程通过受限 IPC 与界面通信，并以逐行 JSON 连接 Python 子进程。打包细节见 [开发指南](docs/开发指南.md)。
 
 ## 常见问题与当前边界
 
