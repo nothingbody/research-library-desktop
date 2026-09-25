@@ -38,7 +38,8 @@ class ReadingAssistantTest(unittest.TestCase):
                 seen.append({'path': self.path, 'authorization': self.headers.get('Authorization'), 'body': body})
                 layout = any('PDF 段落忠实翻译' in str(message.get('content', '')) for message in body.get('messages', []))
                 align = any('双语文本对齐器' in str(message.get('content', '')) for message in body.get('messages', []))
-                content = json.dumps({'translations': {'1': '第一行译文', '2': '第二行译文'}}) if layout else json.dumps({'target': '调度'}) if align else '本地测试结果：仅依据所选原文。'
+                intro = any('你只翻译给出的题名' in str(message.get('content', '')) for message in body.get('messages', []))
+                content = json.dumps({'translations': {'1': '第一行译文', '2': '第二行译文'}}) if layout else json.dumps({'target': '调度'}) if align else json.dumps({'titleZh': '智慧物流', 'abstractZh': '物流研究摘要。', 'keywordsZh': ['物流']}) if intro else '本地测试结果：仅依据所选原文。'
                 response = json.dumps({'choices': [{'message': {'content': content}}]}).encode('utf-8')
                 self.send_response(200); self.send_header('Content-Type', 'application/json'); self.send_header('Content-Length', str(len(response))); self.end_headers(); self.wfile.write(response)
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -71,6 +72,14 @@ class ReadingAssistantTest(unittest.TestCase):
                 VALUES(?,?,?,?,?,?,?,?,?,?)''',
                        (attachment_id, self.item['id'], object_id, 'fixture.pdf', 'fixture-version', 'indexed', len(pages), dumps(pages), 'main', now()))
         return attachment_id
+
+    def test_bibliographic_intro_translation_uses_configured_model(self):
+        self.app.call('assistant.configure', {'apiKey': 'local-test-key'})
+        result = self.app.assistant.search_intro({'title': 'Smart logistics', 'abstract': 'Logistics research abstract.',
+                                                  'keywords': ['logistics']})
+        self.assertEqual(result['titleZh'], '智慧物流')
+        self.assertEqual(result['keywordsZh'], ['物流'])
+        self.assertEqual(self.seen[-1]['authorization'], 'Bearer local-test-key')
 
     def test_reading_workspace_terms_and_assistant_are_local_and_searchable(self):
         reading = self.app.call('reading.get', {'itemId': self.item['id']})

@@ -10,6 +10,7 @@ explanation never becomes the only evidence for a result.
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
+import hashlib
 import json
 import re
 import threading
@@ -98,7 +99,21 @@ class AiSearch:
         criteria = infer(brief)
         concepts = {criterion['id'] for criterion in criteria}
         query_pairs = []
-        if 'fjsp' in concepts and 'transport' in concepts:
+        if ('物流' in brief or 'logistics' in brief.casefold()) and (
+                '大模型' in brief or '语言模型' in brief or 'llm' in brief.casefold()):
+            criteria = [
+                {'id': 'logistics-domain', 'label': '物流或供应链领域', 'kind': 'include', 'required': True,
+                 'terms': ['logistics', 'supply chain', 'freight', 'warehousing', '物流', '供应链'], 'negativeTerms': []},
+                {'id': 'large-language-model', 'label': '大模型或生成式 AI', 'kind': 'include', 'required': True,
+                 'terms': ['large language model', 'large language models', 'LLM', 'generative AI',
+                           'foundation model', 'ChatGPT', '大模型', '生成式人工智能'], 'negativeTerms': []},
+            ] + criteria
+            query_pairs = [
+                ('大模型与智慧物流', 'large language models smart logistics review'),
+                ('生成式 AI 与物流', 'generative AI logistics supply chain survey'),
+                ('智慧物流发展', 'smart logistics artificial intelligence literature review'),
+            ]
+        elif 'fjsp' in concepts and 'transport' in concepts:
             # Public English-language indexes perform poorly when an entire Chinese
             # instruction paragraph is sent as a query. Search domain concepts instead.
             suffix = ' review' if 'review' in concepts else ''
@@ -192,7 +207,7 @@ class AiSearch:
 
     def create(self, payload):
         brief = _text(payload.get('brief'), 6000)
-        require(12 <= len(brief) <= 6000, '请用12–6000个字符描述研究任务')
+        require(2 <= len(brief) <= 6000, '请输入2–6000个字符的研究问题')
         mode = payload.get('mode', 'quick')
         require(mode in ('quick', 'deep'), '检索模式不正确')
         sources = self._clean_sources(payload.get('sources'))
@@ -364,7 +379,9 @@ class AiSearch:
                             'abstract': self._abstract_from_index(item.get('abstract_inverted_index')), 'doi': doi(item.get('doi')),
                             'url': _text((item.get('primary_location') or {}).get('landing_page_url') or item.get('id'), 1200),
                             'citationCount': int(item.get('cited_by_count') or 0), 'oaUrl': _text((item.get('open_access') or {}).get('oa_url'), 1200),
-                            'type': _text(item.get('type'), 100), 'raw': item})
+                             'type': _text(item.get('type'), 100),
+                             'keywords': [_text(value.get('display_name'), 160) for value in (item.get('keywords') or [])
+                                          if isinstance(value, dict) and _text(value.get('display_name'), 160)][:20], 'raw': item})
         return records
 
     def _crossref(self, query, limit, offset=0):
@@ -507,7 +524,7 @@ class AiSearch:
 
     @staticmethod
     def _merge(variants):
-        fields = ['title', 'authors', 'year', 'venue', 'issn', 'abstract', 'doi', 'url', 'citationCount', 'oaUrl', 'type']
+        fields = ['title', 'authors', 'year', 'venue', 'issn', 'abstract', 'keywords', 'doi', 'url', 'citationCount', 'oaUrl', 'type']
         result, provenance = {}, {}
         ranks = {'crossref': 0, 'pubmed': 1, 'openalex': 2, 'arxiv': 3}
         for field in fields:
@@ -516,7 +533,7 @@ class AiSearch:
                 priority = (0 if v['source'] == 'openalex' else 1) if field in ('citationCount', 'oaUrl') else ranks.get(v['source'], 9)
                 return (priority, v['source'], str(v.get('sourceId', '')))
             options.sort(key=order)
-            result[field] = options[0][field] if options else ([] if field == 'authors' else None if field == 'year' else 0 if field == 'citationCount' else '')
+            result[field] = options[0][field] if options else ([] if field in ('authors', 'keywords') else None if field == 'year' else 0 if field == 'citationCount' else '')
             provenance[field] = {'chosenSource': options[0]['source'] if options else None,
                                  'values': [{'value': v[field], 'source': v['source'], 'retrievedAt': v.get('retrievedAt')} for v in options]}
         result['fieldSources'] = provenance
@@ -547,8 +564,10 @@ class AiSearch:
                     tier = 'candidate'
                 candidate_id = existing['id'] if existing else uid()
                 data = {**merged, 'id': candidate_id, 'workId': work_id, 'variants': variants, 'score': score, 'tier': tier,
-                        'explanation': explanation, 'evidence': evidence, 'checks': checks, 'screening': screening,
-                        'sources': sorted({v['source'] for v in variants}), 'fields': {}, 'verification': 'rules', 'runId': session['runId']}
+                         'explanation': explanation, 'evidence': evidence, 'checks': checks, 'screening': screening,
+                         'sources': sorted({v['source'] for v in variants}), 'fields': {}, 'verification': 'rules', 'runId': session['runId']}
+                if old.get('introZh'):
+                    data['introZh'] = old['introZh']
                 # Update the global cache from merged values; current candidates always read their own snapshot.
                 db.execute('UPDATE ai_search_works SET title=?,title_norm=?,authors_json=?,year=?,venue=?,abstract=?,doi=?,url=?,citation_count=?,oa_url=?,type=?,updated_at=? WHERE id=?',
                            (merged['title'], norm(merged['title']), dumps(merged['authors']), merged['year'], merged['venue'], merged['abstract'], merged['doi'], merged['url'], merged['citationCount'], merged['oaUrl'], merged['type'], now(), work_id))
@@ -977,8 +996,13 @@ class AiSearch:
             # Within an unresolved group, prefer more independently supported
             # requirements before falling back to lexical score.
             rank = {'eligible': 2, 'pending': 1, 'excluded': 0}
+            priority = [criterion['id'] for criterion in run_plan.get('criteria', []) if criterion.get('required')]
+            def supported_in_order(row):
+                checks = {check['id']: check['status'] for check in row.get('checks', [])}
+                return tuple(checks.get(identifier) == 'pass' for identifier in priority)
             values.sort(key=lambda r: (
                 rank.get(r.get('screening'), 1),
+                supported_in_order(r),
                 sum(c.get('status') == 'pass' for c in r.get('checks', []) if c.get('required')),
                 any(c.get('id') == 'review' and c.get('required') and c.get('status') == 'pass'
                     for c in r.get('checks', [])),
@@ -1006,6 +1030,34 @@ class AiSearch:
                                   (candidate.get('runId'), candidate_id)).fetchone()
         candidate['semantic'] = dict(semantic) if semantic else None
         return candidate
+
+    def intro(self, payload):
+        """Translate public bibliographic fields on first opening, then reuse the saved result."""
+        candidate_id = payload.get('candidateId')
+        require(isinstance(candidate_id, str), '缺少候选文献标识')
+        candidate = self.evidence(candidate_id)
+        source = {'title': candidate['title'], 'abstract': candidate.get('abstract') or '',
+                  'keywords': candidate.get('keywords') or []}
+        source_hash = hashlib.sha256(dumps(source).encode('utf-8')).hexdigest()
+        cached = candidate.get('introZh') or {}
+        if cached.get('sourceHash') == source_hash:
+            return candidate
+        require(self.library.get_settings().get('online', True), '联网已关闭，原文仍可查看')
+        require(self.assistant and self.assistant.status().get('ready'), '请先在设置中配置 AI 服务，原文仍可查看')
+        translated = self.assistant.search_intro(source)
+        intro = {'title': _text(translated.get('titleZh'), 1500),
+                 'abstract': _text(translated.get('abstractZh'), 20000),
+                 'keywords': [_text(value, 160) for value in translated.get('keywordsZh', [])],
+                 'sourceHash': source_hash, 'translatedAt': now()}
+        require(intro['title'] and (not source['abstract'] or intro['abstract']), 'AI 未返回完整的题名与摘要译文')
+        require(len(intro['keywords']) == len(source['keywords']), 'AI 返回的关键词译文数量不一致')
+        with self.library.db(True) as db:
+            row = db.execute('SELECT data_json FROM search_candidate_details WHERE candidate_id=?', (candidate_id,)).fetchone()
+            require(row, '候选已不在当前版本，请刷新结果')
+            current = json.loads(row[0])
+            current['introZh'] = intro
+            db.execute('UPDATE search_candidate_details SET data_json=? WHERE candidate_id=?', (dumps(current), candidate_id))
+        return self.evidence(candidate_id)
 
     def decision(self, payload):
         candidate = self.evidence(payload.get('candidateId'))

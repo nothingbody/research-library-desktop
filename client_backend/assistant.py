@@ -131,7 +131,7 @@ class ReadingAssistant:
             key = self._key
         base_url, model = settings.get('assistantBaseUrl', ''), settings.get('assistantModel', '')
         require(base_url and model and key, '请先配置 AI 服务、模型和访问密钥')
-        require(12 <= len(str(brief or '')) <= 6000, '研究任务长度不正确')
+        require(2 <= len(str(brief or '')) <= 6000, '研究任务长度不正确')
         instruction = '''你是学术信息检索规划助手。只根据用户提供的研究任务生成检索计划；不要声称已经检索过文献，不要虚构结论。
 只输出 JSON 对象，不要 Markdown。对象必须包含 summary、questions、queries、inclusion、exclusion、criteria、termMappings。
 queries 是1到6个对象的数组，每项包含label、query、enabled:true；query应以准确的英文检索词为主，不混入输出格式要求。
@@ -189,6 +189,43 @@ termMappings是term和translation对象数组。调度优化中的代理模型�
             raise AppError('VERIFY_NETWORK_ERROR', 'AI核验连接失败或超时，规则结果已保留', retryable=True) from exc
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise AppError('VERIFY_FORMAT_ERROR', 'AI核验未返回有效JSON，规则结果已保留') from exc
+
+    def search_intro(self, source):
+        """Translate an opened paper's public title, abstract and supplied keywords."""
+        settings = self.library.get_settings()
+        with self._lock:
+            key = self._key
+        base_url, model = settings.get('assistantBaseUrl', ''), settings.get('assistantModel', '')
+        require(settings.get('online', True) and base_url and model and key, '请先配置联网 AI 服务')
+        require(isinstance(source, dict) and source.get('title'), '论文题录不完整')
+        context = {'title': str(source['title'])[:1500], 'abstract': str(source.get('abstract') or '')[:16000],
+                   'keywords': [str(value)[:160] for value in (source.get('keywords') or [])[:20]]}
+        instruction = (ACADEMIC_TRANSLATION_RULES + '\n你只翻译给出的题名、摘要和关键词，不做总结、相关性判断或推测。'
+                       '摘要必须完整翻译，不增删数据或结论。关键词数组保持原有顺序与数量；输入为空时输出空数组。'
+                       '只输出 JSON 对象：{"titleZh":"中文题名","abstractZh":"中文摘要","keywordsZh":["中文关键词"]}。')
+        body = self._request_body(base_url, model,
+                                  [{'role': 'system', 'content': instruction}, {'role': 'user', 'content': dumps(context)}],
+                                  temperature=0, max_tokens=7000, json_output=True)
+        req = request.Request(self._endpoint(base_url), body,
+                              {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key}, method='POST')
+        try:
+            with request.urlopen(req, timeout=int(settings.get('assistantTimeout', 45))) as response:
+                require(response.status == 200, 'AI 服务返回异常状态')
+                raw = response.read(3 * 1024 * 1024 + 1)
+        except error.HTTPError as exc:
+            raise AppError('ASSISTANT_HTTP_ERROR', f'题录翻译请求失败（HTTP {exc.code}）', retryable=exc.code >= 500) from exc
+        except (error.URLError, TimeoutError) as exc:
+            raise AppError('ASSISTANT_NETWORK_ERROR', '题录翻译连接失败或超时，原文仍可查看', retryable=True) from exc
+        require(len(raw) <= 3 * 1024 * 1024, 'AI 服务返回内容过大')
+        try:
+            value = json.loads(json.loads(raw.decode('utf-8'))['choices'][0]['message']['content'])
+        except (UnicodeDecodeError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise AppError('ASSISTANT_RESPONSE_INVALID', '题录翻译未返回有效 JSON，原文仍可查看') from exc
+        require(isinstance(value, dict) and isinstance(value.get('titleZh'), str)
+                and isinstance(value.get('abstractZh'), str)
+                and isinstance(value.get('keywordsZh'), list)
+                and all(isinstance(item, str) for item in value['keywordsZh']), '题录翻译字段不完整，原文仍可查看')
+        return value
 
     def relation_json(self, context):
         """Run an explicitly requested, evidence-constrained multi-paper pass.

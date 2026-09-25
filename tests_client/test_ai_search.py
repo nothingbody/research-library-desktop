@@ -2,6 +2,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from client_backend.common import AppError
 from client_backend.service import Application
@@ -63,6 +64,52 @@ class AiSearchTest(unittest.TestCase):
         again = self.app.call('aiSearch.import', {'candidateIds': [candidate['id']]})
         self.assertEqual(len(again['existing']), 1)
         self.assertEqual(self.app.call('library.stats', {})['items'], 1)
+
+    def test_opening_paper_translates_and_caches_public_intro(self):
+        session = self.app.call('aiSearch.create', {
+            'brief': 'large language models for smart logistics review',
+            'sources': ['openalex'], 'useModel': False,
+        })
+        record = self.record('openalex', title='Smart logistics: a review')
+        record['keywords'] = ['smart logistics', 'language models']
+        self.app.ai_search._source_records = lambda source, queries, limit: [record]
+        job = self.app.call('aiSearch.run', {'sessionId': session['id']})
+        self.assertEqual(self.wait_job(job['jobId'])['state'], 'completed')
+        candidate = self.app.call('aiSearch.results', {'sessionId': session['id']})['items'][0]
+        translated = {'titleZh': '智慧物流：一项综述', 'abstractZh': '柔性作业车间调度使用机器学习。',
+                      'keywordsZh': ['智慧物流', '语言模型']}
+        with patch.object(self.app.assistant, 'status', return_value={'ready': True}), \
+                patch.object(self.app.assistant, 'search_intro', return_value=translated) as translate:
+            first = self.app.call('aiSearch.intro', {'candidateId': candidate['id']})
+            second = self.app.call('aiSearch.intro', {'candidateId': candidate['id']})
+        self.assertEqual(first['introZh']['title'], translated['titleZh'])
+        self.assertEqual(second['introZh']['keywords'], translated['keywordsZh'])
+        translate.assert_called_once()
+
+    def test_short_chinese_logistics_question_runs_without_plan_edit(self):
+        session = self.app.call('aiSearch.create', {
+            'brief': '大模型下的智慧物流发展综述', 'sources': ['openalex'], 'useModel': False,
+        })
+        queries = [row['query'] for row in session['plan']['queries']]
+        self.assertTrue(any('large language models' in query for query in queries))
+        self.assertEqual({'logistics-domain', 'large-language-model'},
+                         {c['id'] for c in session['plan']['criteria'] if c['required']} & {'logistics-domain', 'large-language-model'})
+        self.assertEqual(session['state'], 'planned')
+        self.app.ai_search._source_records = lambda source, queries, limit: [self.record(source)]
+        self.assertEqual(self.wait_job(self.app.call('aiSearch.run', {'sessionId': session['id']})['jobId'])['state'], 'completed')
+
+    def test_logistics_topic_ranks_before_llm_paper_in_another_field(self):
+        session = self.app.call('aiSearch.create', {
+            'brief': '大模型下的智慧物流发展综述', 'sources': ['openalex'], 'useModel': False,
+        })
+        education = self.record('openalex', 'Large language models in education: a review', '10.1000/education')
+        education.update(sourceId='education', abstract='Generative AI and LLM tools in education are reviewed.')
+        logistics = self.record('openalex', 'Artificial intelligence in logistics: a review', '10.1000/logistics')
+        logistics.update(sourceId='logistics', abstract='Logistics and supply chain practices are reviewed.')
+        self.app.ai_search._source_records = lambda source, queries, limit: [education, logistics]
+        self.assertEqual(self.wait_job(self.app.call('aiSearch.run', {'sessionId': session['id']})['jobId'])['state'], 'completed')
+        rows = self.app.call('aiSearch.results', {'sessionId': session['id']})['items']
+        self.assertEqual([row['doi'] for row in rows], ['10.1000/logistics', '10.1000/education'])
 
     def test_import_candidate_without_publication_year(self):
         session = self.app.call('aiSearch.create', {
