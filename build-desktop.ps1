@@ -16,7 +16,7 @@ if ($InstallDependencies) {
     try { & $taskNpm ci; Check-Exit } finally { Pop-Location }
 }
 if (-not (Test-Path -LiteralPath $taskPython)) { throw '先使用 -InstallDependencies 初始化构建环境（需要 Python 3.12 和 Node）。' }
-& $taskPython -m PyInstaller --noconfirm --name research-backend --onedir --console --distpath dist/backend --workpath build/backend --collect-all bibtexparser --collect-all pypdf --collect-all aiohttp --hidden-import async_runtime backend_entry.py
+& $taskPython -m PyInstaller --noconfirm --name research-backend --onedir --console --distpath dist/backend --workpath build/backend --collect-all bibtexparser --collect-all pylatexenc --collect-all pypdf --collect-all aiohttp --hidden-import async_runtime backend_entry.py
 Check-Exit
 Push-Location (Join-Path $taskRoot 'desktop')
 try {

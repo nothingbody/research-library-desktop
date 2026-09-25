@@ -15,7 +15,7 @@ class Imports:
 
     def preview(self, paths, item_id=None):
         require(isinstance(paths, list) and 0 < len(paths) <= 500, '一次最多选择500个文件')
-        entries, errors = [], []
+        entries, errors, seen_in_batch = [], [], {}
         for file_index, source in enumerate(paths):
             path = Path(source).resolve()
             try:
@@ -54,8 +54,12 @@ class Imports:
                             duplicate = db.execute('SELECT id,title FROM items WHERE doi=? AND deleted_at IS NULL LIMIT 1', (doi(record['DOI']),)).fetchone()
                         if not duplicate and not attachment:
                             duplicate = db.execute('SELECT id,title FROM items WHERE title_norm=? AND year=? AND deleted_at IS NULL LIMIT 1', (norm(record['title']), year_of(record))).fetchone()
+                        match_key = ('pdf:' + digest) if attachment else ('doi:' + doi(record['DOI']) if record.get('DOI') else 'title:' + norm(record['title']) + ':' + year_of(record))
+                        if not duplicate and match_key in seen_in_batch:
+                            duplicate = {'title': seen_in_batch[match_key]['title'], 'batchKey': seen_in_batch[match_key]['key']}
+                        seen_in_batch.setdefault(match_key, {'key': f'{file_index}:{index}', 'title': record['title']})
                         entries.append({'key': f'{file_index}:{index}', 'path': str(path), 'fileName': path.name, 'digest': digest,
-                                        'data': record, 'attachment': attachment, 'warning': warning, 'duplicate': dict(duplicate) if duplicate else None})
+                                        'data': record, 'attachment': attachment, 'matchKey': match_key, 'warning': warning, 'duplicate': dict(duplicate) if duplicate else None})
             except Exception as exc:
                 errors.append({'fileName': path.name, 'message': str(exc)[:300]})
         batch_id = uid()
@@ -72,7 +76,8 @@ class Imports:
         keys = set(payload.get('keys', [entry['key'] for entry in batch['entries']]))
         entries = [entry for entry in batch['entries'] if entry['key'] in keys]
         mode = payload.get('mode') or self.library.get_settings().get('attachmentMode', 'managed')
-        ids, errors, skipped = [], [], 0
+        ids, errors, skipped, created = [], [], 0, set()
+        matched = {}
         for index, entry in enumerate(entries):
             progress(index / max(len(entries), 1), f'导入 {index + 1}/{len(entries)}：{entry["fileName"]}')
             try:
@@ -82,14 +87,25 @@ class Imports:
                     previous = db.execute('SELECT item_id FROM import_entries WHERE batch_id=? AND entry_key=?', (payload['batchId'], entry['key'])).fetchone()
                     if previous:
                         item_id = previous[0]
+                        skipped += 1
                     elif batch.get('itemId'):
                         item_id = batch['itemId']
                         self.library._get(db, item_id)
-                    elif entry['duplicate'] and not payload.get('keepDuplicates'):
-                        item_id = entry['duplicate']['id']
+                    elif entry.get('matchKey') and entry['matchKey'] in matched and not payload.get('keepDuplicates'):
+                        item_id = matched[entry['matchKey']]
                         skipped += 1
+                    elif entry['duplicate'] and not payload.get('keepDuplicates'):
+                        if entry['duplicate'].get('id'):
+                            item_id = entry['duplicate']['id']
+                            skipped += 1
+                        else:
+                            item_id = self.library._create(db, entry['data'], payload.get('collectionId'), 'import:' + entry['fileName'])
+                            created.add(item_id)
                     else:
                         item_id = self.library._create(db, entry['data'], payload.get('collectionId'), 'import:' + entry['fileName'])
+                        created.add(item_id)
+                    if entry.get('matchKey'):
+                        matched[entry['matchKey']] = item_id
                     db.execute('INSERT OR IGNORE INTO import_entries VALUES(?,?,?)', (payload['batchId'], entry['key'], item_id))
                     if payload.get('collectionId'):
                         db.execute('INSERT OR IGNORE INTO collection_items VALUES(?,?)', (payload['collectionId'], item_id))
@@ -108,4 +124,4 @@ class Imports:
                 errors.append({'fileName': entry['fileName'], 'message': str(exc)[:300]})
         with self.library.db(True) as db:
             db.execute('UPDATE import_batches SET state=? WHERE id=?', ('partial' if errors else 'completed', payload['batchId']))
-        return {'itemIds': list(dict.fromkeys(ids)), 'imported': len(set(ids)), 'skipped': skipped, 'errors': errors}
+        return {'itemIds': list(dict.fromkeys(ids)), 'imported': len(created), 'skipped': skipped, 'errors': errors}

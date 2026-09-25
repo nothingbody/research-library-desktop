@@ -19,35 +19,52 @@ class Backups:
         require(parent.exists() and parent.is_dir(), '备份目录不存在')
         require(not parent.is_relative_to(self.library.storage), '不能备份到附件目录中')
         backup = parent / ('ResearchLibrary-' + now()[:19].replace(':', '') + '-' + uid()[:6])
-        backup.mkdir()
-        database = backup / 'library.sqlite3'
-        with self.library.writer:
-            source = sqlite3.connect(self.library.path)
-            destination = sqlite3.connect(database)
-            try:
-                source.backup(destination)
-            finally:
-                source.close()
-                destination.close()
-        with closing(sqlite3.connect(database)) as db:
-            db.row_factory = sqlite3.Row
-            objects = [dict(row) for row in db.execute('SELECT * FROM objects')]
-        files = []
-        for index, obj in enumerate(objects):
-            progress(index / max(1, len(objects)), f'备份附件 {index + 1}/{len(objects)}')
-            source = Path(obj['path']).resolve()
-            require(source.is_file(), f'附件缺失，备份尚未完成：{source.name}')
-            require(sha256(source) == obj['sha256'], f'附件已修改，先重新定位：{source.name}')
-            relative = 'objects/' + obj['sha256']
-            target = within(backup / relative, backup)
-            target.parent.mkdir(exist_ok=True)
-            if not target.exists():
-                shutil.copyfile(source, target)
-            require(sha256(target) == obj['sha256'], '备份附件校验失败')
-            files.append({'objectId': obj['id'], 'path': relative, 'sha256': obj['sha256'], 'bytes': obj['bytes']})
-        manifest = {'format': 'research-library-backup', 'version': 1, 'createdAt': now(), 'databaseSha256': sha256(database), 'objects': files}
-        atomic_json(backup / 'manifest.json', manifest)
-        return {'path': str(backup), 'objects': len(files), 'verified': True}
+        staging = parent / ('.' + backup.name + '-incomplete')
+        require(staging.resolve().parent == parent and backup.resolve().parent == parent, '备份目标目录不安全')
+        staging.mkdir()
+        try:
+            database = staging / 'library.sqlite3'
+            with self.library.writer:
+                with closing(sqlite3.connect(self.library.path)) as source, closing(sqlite3.connect(database)) as destination:
+                    source.backup(destination)
+            files, unavailable, warnings = [], [], []
+            with closing(sqlite3.connect(database)) as db:
+                db.row_factory = sqlite3.Row
+                db.execute('PRAGMA foreign_keys=ON')
+                objects = [dict(row) for row in db.execute('SELECT * FROM objects')]
+                for index, obj in enumerate(objects):
+                    progress(index / max(1, len(objects)), f'备份附件 {index + 1}/{len(objects)}')
+                    source = Path(obj['path']).resolve()
+                    if not source.is_file():
+                        unavailable.append({'objectId': obj['id'], 'sha256': obj['sha256'], 'bytes': obj['bytes'], 'reason': 'missing'})
+                        warnings.append({'objectId': obj['id'], 'name': source.name, 'reason': '附件缺失，恢复后需要重新定位'})
+                        continue
+                    actual_hash = sha256(source)
+                    actual_bytes = source.stat().st_size
+                    relative = 'objects/' + actual_hash
+                    target = within(staging / relative, staging)
+                    target.parent.mkdir(exist_ok=True)
+                    if not target.exists():
+                        shutil.copyfile(source, target)
+                    require(sha256(target) == actual_hash, '备份附件校验失败，请重试')
+                    if actual_hash != obj['sha256']:
+                        warnings.append({'objectId': obj['id'], 'name': source.name, 'reason': '附件已在外部修改；已保存当前文件，旧批注标为过期'})
+                        db.execute('UPDATE objects SET sha256=?,bytes=? WHERE id=?', (actual_hash, actual_bytes, obj['id']))
+                        db.execute("UPDATE attachments SET version=?,text_status='pending',text_json=NULL,page_count=NULL WHERE object_id=?", (actual_hash, obj['id']))
+                        db.execute('DELETE FROM document_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE object_id=?)', (obj['id'],))
+                    files.append({'objectId': obj['id'], 'path': relative, 'sha256': actual_hash, 'bytes': actual_bytes})
+                db.commit()
+            manifest = {'format': 'research-library-backup', 'version': 2, 'createdAt': now(),
+                        'databaseSha256': sha256(database), 'objects': files, 'unavailableObjects': unavailable,
+                        'warnings': warnings}
+            atomic_json(staging / 'manifest.json', manifest)
+            staging.rename(backup)
+            return {'path': str(backup), 'objects': len(files), 'unavailable': len(unavailable),
+                    'warnings': warnings, 'verified': True, 'complete': not warnings}
+        except Exception:
+            if staging.exists() and staging.resolve().parent == parent and staging.name.endswith('-incomplete'):
+                shutil.rmtree(staging)
+            raise
 
     def verify(self, backup):
         backup = Path(backup).resolve()
@@ -56,7 +73,7 @@ class Backups:
             manifest = json.loads((backup / 'manifest.json').read_text(encoding='utf-8'))
         except (OSError, ValueError) as exc:
             raise AppError('BACKUP_INVALID', '缺少有效的备份完成清单') from exc
-        require(manifest.get('format') == 'research-library-backup' and manifest.get('version') == 1, '不支持的备份格式')
+        require(manifest.get('format') == 'research-library-backup' and manifest.get('version') in (1, 2), '不支持的备份格式')
         database = backup / 'library.sqlite3'
         require(sha256(database) == manifest['databaseSha256'], '备份数据库校验失败')
         with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
@@ -70,8 +87,10 @@ class Backups:
             require(path.is_file() and path.stat().st_size == obj['bytes'] and sha256(path) == obj['sha256'], '备份附件校验失败')
             require(obj['objectId'] not in manifest_objects, '备份包含重复对象')
             manifest_objects[obj['objectId']] = obj['sha256']
-        require(db_objects == manifest_objects, '备份附件清单与数据库不一致')
-        return {'path': str(backup), 'manifest': manifest, 'counts': counts, 'verified': True}
+        unavailable = {obj['objectId']: obj['sha256'] for obj in manifest.get('unavailableObjects', [])}
+        require(not (set(manifest_objects) & set(unavailable)) and db_objects == {**manifest_objects, **unavailable}, '备份附件清单与数据库不一致')
+        return {'path': str(backup), 'manifest': manifest, 'counts': counts, 'verified': True,
+                'complete': not unavailable and not manifest.get('warnings')}
 
     def restore(self, payload, progress):
         verified = self.verify(payload['backup'])
@@ -93,7 +112,11 @@ class Backups:
                     shutil.copyfile(source, destination)
                 require(sha256(destination) == obj['sha256'], '恢复附件校验失败')
                 db.execute("UPDATE objects SET path=?,mode='managed' WHERE id=?", (str(destination), obj['objectId']))
+            for obj in verified['manifest'].get('unavailableObjects', []):
+                destination = within(storage / obj['sha256'][:2] / obj['sha256'], storage)
+                db.execute("UPDATE objects SET path=?,mode='managed' WHERE id=?", (str(destination), obj['objectId']))
             db.execute("UPDATE jobs SET state='cancelled',message='从备份恢复，待用户重新运行' WHERE state IN ('pending','running')")
             db.commit()
         atomic_json(target / 'restore-complete.json', {'source': verified['path'], 'restoredAt': now(), 'counts': verified['counts']})
-        return {'path': str(target), 'counts': verified['counts'], 'message': '已恢复为独立文献库，可在设置中切换；原库未被覆盖'}
+        return {'path': str(target), 'counts': verified['counts'], 'unavailable': len(verified['manifest'].get('unavailableObjects', [])),
+                'message': '已恢复为独立文献库；缺失附件需重新定位。原库未被覆盖'}

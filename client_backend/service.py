@@ -102,7 +102,7 @@ class Application:
     def call(self, method, p):
         library, attachments = self.library, self.attachments
         routes = {
-            'app.info': lambda: {'version': '0.9.27', 'root': str(library.root), 'settings': library.get_settings()},
+            'app.info': lambda: {'version': '0.9.31', 'root': str(library.root), 'settings': library.get_settings()},
             'library.stats': library.stats,
             'library.reindex': lambda: self.jobs.create('library.index', {}),
             'items.list': lambda: library.query(p),
@@ -113,6 +113,7 @@ class Application:
             'browser.importDownloaded': lambda: browser_import_downloaded(library, self.fulltext, p),
             'items.update': lambda: library.update(p['id'], p['patch'], p['revision']),
             'items.bulk': lambda: library.bulk(p['ids'], p['action'], p.get('value')),
+            'items.deletePermanently': lambda: library.delete_permanently(p.get('ids')),
             'items.duplicates': library.duplicates,
             'items.merge': lambda: library.merge(p['targetId'], p['sourceIds']),
             'items.undoMerge': lambda: library.undo_merge(p['eventId']),
@@ -241,7 +242,7 @@ class Application:
         if method not in routes:
             raise AppError('METHOD_NOT_FOUND', '不支持的操作')
         result = routes[method]()
-        if method in {'items.create', 'browser.capture', 'browser.importDownloaded', 'items.update', 'items.bulk', 'items.merge', 'items.undoMerge', 'collections.edit', 'attachments.setRole',
+        if method in {'items.create', 'browser.capture', 'browser.importDownloaded', 'items.update', 'items.bulk', 'items.deletePermanently', 'items.merge', 'items.undoMerge', 'collections.edit', 'attachments.setRole',
                       'notes.save', 'notes.delete', 'annotations.excerpt', 'metadata.apply', 'settings.save', 'reading.save',
                       'reading.activity', 'terms.save', 'terms.delete', 'assistant.settings', 'assistant.run', 'assistant.translation.page', 'assistant.apply',
                       'aiSearch.create', 'aiSearch.savePlan', 'aiSearch.run', 'aiSearch.expand', 'aiSearch.citationExpand', 'aiSearch.rerank', 'aiSearch.intro', 'aiSearch.import', 'aiSearch.cancel', 'aiSearch.verify', 'aiSearch.decision', 'searchEvaluation.save',

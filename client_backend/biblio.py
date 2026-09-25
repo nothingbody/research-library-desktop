@@ -9,12 +9,65 @@ import bibtexparser
 from bibtexparser.bparser import BibTexParser
 from bibtexparser.bwriter import BibTexWriter
 from bibtexparser.bibdatabase import BibDatabase
+from pylatexenc.latex2text import LatexNodes2Text
 
 from .common import AppError, doi, require
 
 TYPE_TO_CSL = {'article': 'article-journal', 'inproceedings': 'paper-conference', 'conference': 'paper-conference',
                'book': 'book', 'incollection': 'chapter', 'phdthesis': 'thesis', 'mastersthesis': 'thesis',
-               'techreport': 'report', 'misc': 'document', 'online': 'webpage'}
+               'techreport': 'report', 'misc': 'document', 'online': 'webpage', 'unpublished': 'manuscript'}
+SOURCE_TO_CSL = {'journal-article': 'article-journal', 'proceedings-article': 'paper-conference',
+                 'book-chapter': 'chapter', 'posted-content': 'manuscript', 'preprint': 'manuscript',
+                 'article': 'article-journal', 'review': 'article-journal', 'dissertation': 'thesis',
+                 'reference-entry': 'entry', 'journal-issue': 'periodical', 'journal-volume': 'periodical',
+                 'journal': 'periodical', 'proceedings': 'book', 'edited-book': 'book',
+                 'book-set': 'book', 'book-series': 'collection', 'other': 'document',
+                 'letter': 'personal_communication', 'editorial': 'article-journal',
+                 'supplementary-material': 'document'}
+CSL_TYPES = {'article', 'article-journal', 'article-magazine', 'article-newspaper', 'bill', 'book',
+             'broadcast', 'chapter', 'classic', 'collection', 'dataset', 'document', 'entry',
+             'entry-dictionary', 'entry-encyclopedia', 'event', 'figure', 'graphic', 'hearing',
+             'interview', 'legal_case', 'legislation', 'manuscript', 'map', 'motion_picture',
+             'musical_score', 'pamphlet', 'paper-conference', 'patent', 'performance',
+             'periodical', 'personal_communication', 'post', 'post-weblog', 'regulation',
+             'report', 'review', 'review-book', 'software', 'song', 'speech', 'standard',
+             'thesis', 'treaty', 'webpage'}
+CSL_TO_BIB = {'article-journal': 'article', 'paper-conference': 'inproceedings', 'book': 'book',
+              'chapter': 'incollection', 'thesis': 'phdthesis', 'report': 'techreport',
+              'manuscript': 'unpublished', 'webpage': 'misc', 'document': 'misc'}
+CSL_FIELDS = {
+    'type', 'title', 'title-short', 'author', 'editor', 'translator', 'container-author',
+    'issued', 'accessed', 'submitted', 'original-date', 'event-date', 'container-title',
+    'container-title-short', 'collection-title', 'collection-number', 'volume', 'issue',
+    'number', 'page', 'page-first', 'number-of-pages', 'edition', 'chapter-number',
+    'DOI', 'URL', 'PMID', 'PMCID', 'abstract', 'publisher', 'publisher-place',
+    'ISSN', 'ISBN', 'language', 'genre', 'keyword', 'note', 'status', 'medium',
+    'event', 'event-title', 'event-place', 'archive', 'archive_location',
+    'archive-place', 'jurisdiction', 'version', 'source',
+}
+LATEX = LatexNodes2Text()
+
+
+def latex_text(value):
+    return LATEX.latex_to_text(str(value or '')).strip()
+
+
+def csl_type(value):
+    value = str(value or 'article-journal').lower()
+    result = SOURCE_TO_CSL.get(value, value)
+    return result if result in CSL_TYPES else 'document'
+
+
+def csl_record(item):
+    result = {key: item[key] for key in sorted(CSL_FIELDS) if item.get(key) not in (None, '', [], {})}
+    result['id'] = str(item.get('citationKey') or item.get('id') or '')
+    result['type'] = csl_type(result.get('type'))
+    if result.get('author'):
+        result['author'] = [{key: name[key] for key in ('family', 'given', 'literal', 'suffix') if name.get(key)}
+                            for name in result['author'] if isinstance(name, dict)]
+    if result.get('page'):
+        result['page'] = re.sub(r'\s*(?:--+|[–—])\s*', '-', str(result['page']))
+    return result
 
 
 def author_name(value):
@@ -38,7 +91,7 @@ def normalize(data):
     require(isinstance(data, dict), '题录必须为对象')
     value = dict(data)
     value.pop('id', None)
-    value.setdefault('type', 'article-journal')
+    value['type'] = csl_type(value.get('type'))
     value['title'] = str(value.get('title') or '').strip()
     require(value['title'], '标题不能为空')
     require(len(value['title']) <= 20000, '标题过长')
@@ -88,7 +141,10 @@ def split_bib_authors(value):
                 continue
         index += 1
     parts.append(value[start:])
-    return [author_name(part) for part in parts if part.strip()]
+    return [{'literal': '等'} if part.strip().casefold() == 'others' else
+            {'literal': latex_text(part.strip()[1:-1])} if part.strip().startswith('{') and part.strip().endswith('}') else
+            author_name(latex_text(part))
+            for part in parts if part.strip()]
 
 
 def parse_bib(text):
@@ -98,17 +154,19 @@ def parse_bib(text):
     database = bibtexparser.loads(text, parser=parser)
     result = []
     for record in database.entries:
-        item = {'type': TYPE_TO_CSL.get(record.get('ENTRYTYPE'), 'document'), 'title': record.get('title', ''),
+        item = {'type': TYPE_TO_CSL.get(record.get('ENTRYTYPE'), 'document'), 'title': latex_text(record.get('title', '')),
                 'citationKey': record.get('ID', ''), 'author': split_bib_authors(record.get('author', '')),
                 'originalBib': record}
         for key, dest in [('journal', 'container-title'), ('booktitle', 'container-title'), ('year', 'year'),
                           ('doi', 'DOI'), ('url', 'URL'), ('volume', 'volume'), ('number', 'issue'), ('pages', 'page'),
                           ('abstract', 'abstract'), ('publisher', 'publisher'), ('issn', 'ISSN'), ('isbn', 'ISBN')]:
             if record.get(key):
-                item[dest] = record[key]
-        item['tags'] = [x.strip() for x in re.split('[,;]', record.get('keywords', '')) if x.strip()]
+                item[dest] = record[key] if dest in ('year', 'DOI', 'URL', 'ISSN', 'ISBN') else latex_text(record[key])
+        if item.get('page'):
+            item['page'] = re.sub(r'\s*(?:--+|[–—])\s*', '-', item['page'])
+        item['tags'] = [latex_text(x) for x in re.split('[,;]', record.get('keywords', '')) if x.strip()]
         if record.get('journaltitle'):
-            item['container-title'] = record['journaltitle']
+            item['container-title'] = latex_text(record['journaltitle'])
         if record.get('date') and not item.get('year'):
             match = re.match(r'^(\d{4})(?:-(\d{2}))?(?:-(\d{2}))?', record['date'])
             if match:
@@ -145,7 +203,7 @@ def parse_ris(text):
         item = {'type': {'JOUR': 'article-journal', 'BOOK': 'book', 'CHAP': 'chapter', 'CONF': 'paper-conference',
                          'THES': 'thesis', 'RPRT': 'report'}.get(first('TY'), 'document'),
                 'title': first('TI', 'T1'), 'author': [author_name(a) for a in record.get('AU', record.get('A1', []))],
-                'container-title': first('JO', 'JF', 'T2', 'JA'), 'abstract': first('AB', 'N2'),
+                'container-title': first('T2', 'JO', 'JF', 'JA') if first('TY') == 'CHAP' else first('JO', 'JF', 'T2', 'JA'), 'abstract': first('AB', 'N2'),
                 'DOI': first('DO'), 'URL': first('UR'), 'volume': first('VL'), 'issue': first('IS'),
                 'page': first('SP') + (('-' + first('EP')) if first('EP') else ''),
                 'tags': record.get('KW', []), 'originalRIS': record}
@@ -190,13 +248,17 @@ def parse_file(path):
 
 def export_records(items, fmt):
     if fmt == 'json':
-        return json.dumps(items, ensure_ascii=False, indent=2)
+        return json.dumps([csl_record(item) for item in items], ensure_ascii=False, indent=2)
     if fmt in ('bib', 'bibtex', 'biblatex'):
         records = []
         for item in items:
             record = dict(item.get('originalBib') or {})
             original_type = record.get('ENTRYTYPE')
-            record['ENTRYTYPE'] = original_type if original_type and TYPE_TO_CSL.get(original_type, 'document') == item.get('type') else next((k for k, v in TYPE_TO_CSL.items() if v == item.get('type')), 'misc')
+            record['ENTRYTYPE'] = original_type if original_type and TYPE_TO_CSL.get(original_type, 'document') == csl_type(item.get('type')) else CSL_TO_BIB.get(csl_type(item.get('type')), 'misc')
+            if fmt == 'biblatex' and csl_type(item.get('type')) == 'webpage':
+                record['ENTRYTYPE'] = 'online'
+            elif fmt != 'biblatex' and record['ENTRYTYPE'] == 'online':
+                record['ENTRYTYPE'] = 'misc'
             record['ID'] = item.get('citationKey') or 'item' + str(item.get('id', ''))[:8]
             for src, dest in [('title', 'title'), ('DOI', 'doi'), ('URL', 'url'), ('volume', 'volume'), ('issue', 'number'),
                               ('page', 'pages'), ('abstract', 'abstract'), ('publisher', 'publisher'), ('ISSN', 'issn'), ('ISBN', 'isbn')]:
@@ -207,15 +269,22 @@ def export_records(items, fmt):
             for key in ('journal', 'booktitle'):
                 record.pop(key, None)
             if item.get('container-title'):
-                record['journal' if item.get('type') == 'article-journal' else 'booktitle'] = item['container-title']
-            record['year'] = year_of(item)
+                record['journal' if csl_type(item.get('type')) == 'article-journal' else 'booktitle'] = item['container-title']
+            if year_of(item):
+                record['year'] = year_of(item)
+            else:
+                record.pop('year', None)
             if fmt == 'biblatex':
                 if record.get('journal'):
                     record['journaltitle'] = record.pop('journal')
                 parts = item.get('issued', {}).get('date-parts', [])
                 if parts and parts[0]:
                     record['date'] = '-'.join(str(p).zfill(4 if index == 0 else 2) for index, p in enumerate(parts[0]))
-            record['author'] = ' and '.join('{' + a['literal'] + '}' if a.get('literal') else ', '.join(filter(None, [a.get('family'), a.get('given')])) for a in item.get('author', []))
+            authors = ['others' if a.get('literal') == '等' else '{' + a['literal'] + '}' if a.get('literal') else ', '.join(filter(None, [a.get('family'), a.get('given')])) for a in item.get('author', [])]
+            if authors:
+                record['author'] = ' and '.join(authors)
+            else:
+                record.pop('author', None)
             if item.get('tags'):
                 record['keywords'] = ', '.join(item['tags'])
             records.append(record)
@@ -228,11 +297,12 @@ def export_records(items, fmt):
             def line(key, value):
                 if value:
                     lines.append(f'{key}  - {str(value).replace(chr(13), " ").replace(chr(10), " ")}')
-            line('TY', {'article-journal': 'JOUR', 'book': 'BOOK', 'paper-conference': 'CONF', 'thesis': 'THES', 'chapter': 'CHAP'}.get(item.get('type'), 'GEN'))
+            kind = csl_type(item.get('type'))
+            line('TY', {'article-journal': 'JOUR', 'book': 'BOOK', 'paper-conference': 'CONF', 'thesis': 'THES', 'chapter': 'CHAP', 'report': 'RPRT', 'webpage': 'ELEC'}.get(kind, 'GEN'))
             line('TI', item['title'])
             for author in item.get('author', []):
                 line('AU', author.get('literal') or ', '.join(filter(None, [author.get('family'), author.get('given')])))
-            for field, tag in [('container-title', 'JO'), ('DOI', 'DO'), ('URL', 'UR'), ('abstract', 'AB'), ('volume', 'VL'), ('issue', 'IS'), ('ISSN', 'SN')]:
+            for field, tag in [('container-title', 'T2' if kind == 'chapter' else 'JO'), ('DOI', 'DO'), ('URL', 'UR'), ('abstract', 'AB'), ('volume', 'VL'), ('issue', 'IS'), ('ISSN', 'SN')]:
                 line(tag, item.get(field))
             line('PY', year_of(item))
             pages = re.split(r'[-–]+', str(item.get('page', '')), maxsplit=1)

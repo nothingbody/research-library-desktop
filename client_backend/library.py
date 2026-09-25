@@ -411,6 +411,11 @@ class Library:
             for item_id in dict.fromkeys(ids):
                 item = self._get(db, item_id)
                 if action in ('trash', 'restore'):
+                    if action == 'restore':
+                        require(item['deletedAt'] is not None, '文献不在回收站')
+                        for event in db.execute('SELECT data FROM merge_events WHERE undone=0'):
+                            require(item_id not in json.loads(event['data']).get('sourceIds', []),
+                                    '该条目已合并；请在“重复条目”中撤销合并，不能单独恢复')
                     db.execute('UPDATE items SET deleted_at=?,revision=revision+1,updated_at=? WHERE id=?', (now() if action == 'trash' else None, now(), item_id))
                 elif action == 'collection':
                     require(db.execute('SELECT 1 FROM collections WHERE id=?', (value,)).fetchone(), '集合不存在')
@@ -427,6 +432,94 @@ class Library:
                 else:
                     raise AppError('INVALID_ARGUMENT', '不支持的批量操作')
         return {'updated': len(set(ids))}
+
+    def delete_permanently(self, ids=None):
+        """Purge only trashed records; unlink owned files after a committed database deletion."""
+        if ids is not None:
+            require(isinstance(ids, list) and 0 < len(ids) <= 5000, '请选择1–5000条回收站文献')
+            ids = list(dict.fromkeys(ids))
+        owned_paths = []
+        with self.db(True) as db:
+            if ids is None:
+                ids = [row[0] for row in db.execute('SELECT id FROM items WHERE deleted_at IS NOT NULL')]
+            if not ids:
+                return {'deleted': 0, 'removedFiles': 0, 'fileWarnings': []}
+            placeholders = ','.join('?' for _ in ids)
+            rows = db.execute(f'SELECT id FROM items WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL', ids).fetchall()
+            require(len(rows) == len(ids), '只能永久删除回收站中的文献')
+            attachment_ids = [row[0] for row in db.execute(f'SELECT id FROM attachments WHERE item_id IN ({placeholders})', ids)]
+            object_ids = [row[0] for row in db.execute(f'SELECT DISTINCT object_id FROM attachments WHERE item_id IN ({placeholders})', ids)]
+            note_ids = [row[0] for row in db.execute(f'SELECT id FROM notes WHERE item_id IN ({placeholders})', ids)]
+            cluster_ids = [row[0] for row in db.execute(f'SELECT DISTINCT cluster_id FROM writing_citation_items WHERE item_id IN ({placeholders})', ids)]
+            for table in ('collection_items', 'item_tags', 'provenance', 'import_entries', 'terms',
+                          'reading_cards', 'reading_sessions', 'assistant_runs', 'fulltext_sources',
+                          'document_chunks', 'relation_evidence', 'article_profile_evidence',
+                          'relation_session_items', 'research_project_links'):
+                column = 'entity_id' if table == 'research_project_links' else 'item_id'
+                extra = " AND entity_type='item'" if table == 'research_project_links' else ''
+                db.execute(f'DELETE FROM {table} WHERE {column} IN ({placeholders}){extra}', ids)
+            db.execute(f'DELETE FROM item_fts WHERE item_id IN ({placeholders})', ids)
+            db.execute(f'DELETE FROM relation_discoveries WHERE anchor_item_id IN ({placeholders})', ids)
+            db.execute(f'UPDATE relation_discoveries SET imported_item_id=NULL WHERE imported_item_id IN ({placeholders})', ids)
+            db.execute(f'UPDATE ai_search_candidates SET imported_item_id=NULL WHERE imported_item_id IN ({placeholders})', ids)
+            db.execute(f'DELETE FROM relation_discovery_decisions WHERE anchor_item_id IN ({placeholders})', ids)
+            db.execute(f'DELETE FROM relation_discovery_pages WHERE anchor_item_id IN ({placeholders})', ids)
+            for table in ('manual_relations', 'article_relations'):
+                db.execute(f'DELETE FROM {table} WHERE left_item_id IN ({placeholders}) OR right_item_id IN ({placeholders})', ids * 2)
+            db.execute(f'DELETE FROM writing_citation_items WHERE item_id IN ({placeholders})', ids)
+            for cluster_id in cluster_ids:
+                cluster = db.execute('SELECT session_id FROM writing_citation_clusters WHERE id=?', (cluster_id,)).fetchone()
+                if cluster:
+                    if db.execute('SELECT 1 FROM writing_citation_items WHERE cluster_id=?', (cluster_id,)).fetchone():
+                        db.execute("UPDATE writing_citation_clusters SET rendered_text='' WHERE id=?", (cluster_id,))
+                    else:
+                        db.execute('DELETE FROM writing_citation_clusters WHERE id=?', (cluster_id,))
+                    db.execute("UPDATE writing_bibliographies SET rendered_hash='' WHERE session_id=?", (cluster['session_id'],))
+            if note_ids:
+                note_marks = ','.join('?' for _ in note_ids)
+                db.execute(f'DELETE FROM relation_synthesis_notes WHERE note_id IN ({note_marks})', note_ids)
+                db.execute(f'DELETE FROM note_history WHERE note_id IN ({note_marks})', note_ids)
+            db.execute(f'DELETE FROM notes WHERE item_id IN ({placeholders})', ids)
+            if attachment_ids:
+                marks = ','.join('?' for _ in attachment_ids)
+                for table in ('terms', 'reading_sessions', 'assistant_runs'):
+                    db.execute(f'UPDATE {table} SET attachment_id=NULL WHERE attachment_id IN ({marks})', attachment_ids)
+                db.execute(f'DELETE FROM annotations WHERE attachment_id IN ({marks})', attachment_ids)
+            db.execute(f'DELETE FROM attachments WHERE item_id IN ({placeholders})', ids)
+            db.execute(f'DELETE FROM article_profiles WHERE item_id IN ({placeholders})', ids)
+            for row in db.execute('SELECT id,item_ids_json FROM research_conversations').fetchall():
+                original = json.loads(row['item_ids_json'])
+                updated = [item_id for item_id in original if item_id not in ids]
+                if updated != original:
+                    db.execute('UPDATE research_conversations SET item_ids_json=?,updated_at=? WHERE id=?',
+                               (dumps(updated), now(), row['id']))
+            for event in db.execute('SELECT id,data FROM merge_events').fetchall():
+                snapshot = json.loads(event['data'])
+                if snapshot.get('targetId') in ids or set(snapshot.get('sourceIds', [])) & set(ids):
+                    db.execute('DELETE FROM merge_events WHERE id=?', (event['id'],))
+            db.execute(f'DELETE FROM items WHERE id IN ({placeholders})', ids)
+            for object_id in object_ids:
+                if db.execute('SELECT 1 FROM attachments WHERE object_id=?', (object_id,)).fetchone():
+                    continue
+                obj = db.execute('SELECT path,mode FROM objects WHERE id=?', (object_id,)).fetchone()
+                if obj:
+                    db.execute('DELETE FROM objects WHERE id=?', (object_id,))
+                    path = Path(obj['path']).resolve()
+                    if obj['mode'] == 'managed' and path.is_relative_to(self.storage.resolve()) and path != self.storage.resolve():
+                        owned_paths.append(path)
+            require(db.execute('PRAGMA foreign_key_check').fetchone() is None, '删除后数据库关联校验失败')
+        warnings, removed = [], 0
+        for path in set(owned_paths):
+            with self.db() as db:
+                still_used = db.execute('SELECT 1 FROM objects WHERE path=?', (str(path),)).fetchone()
+            if still_used:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+                removed += 1
+            except OSError as exc:
+                warnings.append({'path': str(path), 'error': str(exc)[:200]})
+        return {'deleted': len(ids), 'removedFiles': removed, 'fileWarnings': warnings}
 
     def query(self, params):
         limit = bounded_int(params.get('limit'), 100, 1, 500)
@@ -741,25 +834,156 @@ class Library:
 
     def merge(self, target_id, source_ids):
         require(isinstance(source_ids, list) and 0 < len(source_ids) <= 50 and target_id not in source_ids, '请选择需要合并的其他条目')
-        ids = [target_id, *dict.fromkeys(source_ids)]
+        source_ids = list(dict.fromkeys(source_ids))
+        ids = [target_id, *source_ids]
         placeholders = ','.join('?' for _ in ids)
         with self.db(True) as db:
+            direct = ('attachments', 'notes', 'provenance', 'assistant_runs', 'document_chunks',
+                      'relation_evidence', 'article_profile_evidence', 'import_entries')
             snapshot = {table: [dict(row) for row in db.execute(f'SELECT * FROM {table} WHERE {field} IN ({placeholders})', ids)] for table, field in [
-                ('items', 'id'), ('attachments', 'item_id'), ('notes', 'item_id'), ('collection_items', 'item_id'), ('item_tags', 'item_id'), ('provenance', 'item_id')]}
+                ('items', 'id'), ('attachments', 'item_id'), ('notes', 'item_id'), ('collection_items', 'item_id'),
+                ('item_tags', 'item_id'), ('provenance', 'item_id'), ('assistant_runs', 'item_id'),
+                ('document_chunks', 'item_id'), ('relation_evidence', 'item_id'),
+                ('article_profile_evidence', 'item_id'), ('import_entries', 'item_id'),
+                ('terms', 'item_id'), ('reading_cards', 'item_id'), ('reading_sessions', 'item_id'),
+                ('fulltext_sources', 'item_id'), ('relation_session_items', 'item_id'),
+                ('writing_citation_items', 'item_id'), ('article_profiles', 'item_id'),
+                ('ai_search_candidates', 'imported_item_id'), ('research_project_links', 'entity_id')]}
+            profile_ids = [record['id'] for record in snapshot['article_profiles']]
+            if profile_ids:
+                profile_marks = ','.join('?' for _ in profile_ids)
+                known = {record['id'] for record in snapshot['article_profile_evidence']}
+                snapshot['article_profile_evidence'].extend(dict(row) for row in db.execute(
+                    f'SELECT * FROM article_profile_evidence WHERE profile_id IN ({profile_marks})', profile_ids)
+                    if row['id'] not in known)
+            for table in ('manual_relations', 'article_relations'):
+                snapshot[table] = [dict(row) for row in db.execute(f'''SELECT * FROM {table}
+                    WHERE left_item_id IN ({placeholders}) OR right_item_id IN ({placeholders})''', ids * 2)]
+            for table in ('relation_discoveries', 'relation_discovery_decisions', 'relation_discovery_pages'):
+                snapshot[table] = [dict(row) for row in db.execute(f'SELECT * FROM {table} WHERE anchor_item_id IN ({placeholders})', ids)]
+            snapshot['relation_discovery_imports'] = [dict(row) for row in db.execute(
+                f'SELECT session_id,anchor_item_id,work_id,direction,imported_item_id FROM relation_discoveries WHERE imported_item_id IN ({placeholders})', ids)]
+            snapshot['research_conversations'] = [dict(row) for row in db.execute('SELECT * FROM research_conversations')
+                                                  if any(item_id in json.loads(row['item_ids_json']) for item_id in ids)]
             require(len(snapshot['items']) == len(ids), '合并条目不存在')
             require(all(row['deleted_at'] is None for row in snapshot['items']), '回收站条目不能合并')
             target = self._get(db, target_id)
             combined_tags = list(target.get('tags', []))
+            affected_sessions = set()
             for source_id in source_ids:
                 source = self._get(db, source_id)
                 combined_tags.extend(source.get('tags', []))
-                db.execute('UPDATE attachments SET item_id=? WHERE item_id=?', (target_id, source_id))
-                db.execute('UPDATE notes SET item_id=? WHERE item_id=?', (target_id, source_id))
-                db.execute('UPDATE provenance SET item_id=? WHERE item_id=?', (target_id, source_id))
+                for table in direct:
+                    db.execute(f'UPDATE {table} SET item_id=? WHERE item_id=?', (target_id, source_id))
+                db.execute('UPDATE ai_search_candidates SET imported_item_id=? WHERE imported_item_id=?', (target_id, source_id))
+                db.execute('UPDATE relation_discoveries SET imported_item_id=? WHERE imported_item_id=?', (target_id, source_id))
+                for row in db.execute('SELECT * FROM terms WHERE item_id=?', (source_id,)).fetchall():
+                    term = row['term']
+                    if db.execute('SELECT 1 FROM terms WHERE item_id=? AND term=?', (target_id, term)).fetchone():
+                        term = (term[:135] + '（合并自 ' + source_id[:8] + '）')[:160]
+                    db.execute('UPDATE terms SET item_id=?,term=?,updated_at=? WHERE id=?', (target_id, term, now(), row['id']))
+                source_card = db.execute('SELECT * FROM reading_cards WHERE item_id=?', (source_id,)).fetchone()
+                target_card = db.execute('SELECT * FROM reading_cards WHERE item_id=?', (target_id,)).fetchone()
+                if source_card and target_card:
+                    combined = json.loads(target_card['data'])
+                    for key, value in json.loads(source_card['data']).items():
+                        if not value:
+                            continue
+                        if not combined.get(key):
+                            combined[key] = value
+                        elif combined[key] != value:
+                            combined[key] += '\n\n[合并来源 ' + source_id[:8] + ']\n' + str(value)
+                    db.execute('UPDATE reading_cards SET data=?,revision=revision+1,updated_at=? WHERE id=?',
+                               (dumps(combined), now(), target_card['id']))
+                    db.execute('DELETE FROM reading_cards WHERE id=?', (source_card['id'],))
+                elif source_card:
+                    db.execute('UPDATE reading_cards SET item_id=? WHERE id=?', (target_id, source_card['id']))
+                source_session = db.execute('SELECT * FROM reading_sessions WHERE item_id=?', (source_id,)).fetchone()
+                target_session = db.execute('SELECT * FROM reading_sessions WHERE item_id=?', (target_id,)).fetchone()
+                if source_session and target_session:
+                    status = max((source_session['status'], target_session['status']), key=lambda value: {'planned': 0, 'reading': 1, 'completed': 2}.get(value, 0))
+                    db.execute('''UPDATE reading_sessions SET seconds_read=seconds_read+?,status=?,goal=?,
+                        attachment_id=coalesce(attachment_id,?),last_page=CASE WHEN attachment_id IS NULL THEN ? ELSE last_page END,
+                        revision=revision+1,updated_at=? WHERE id=?''',
+                        (source_session['seconds_read'], status, target_session['goal'] or source_session['goal'],
+                         source_session['attachment_id'], source_session['last_page'], now(), target_session['id']))
+                    db.execute('DELETE FROM reading_sessions WHERE id=?', (source_session['id'],))
+                elif source_session:
+                    db.execute('UPDATE reading_sessions SET item_id=? WHERE id=?', (target_id, source_session['id']))
+                for row in db.execute('SELECT * FROM fulltext_sources WHERE item_id=?', (source_id,)).fetchall():
+                    existing_source = db.execute('SELECT * FROM fulltext_sources WHERE item_id=? AND url=?', (target_id, row['url'])).fetchone()
+                    if existing_source:
+                        if row['attachment_id'] and not existing_source['attachment_id']:
+                            db.execute('''UPDATE fulltext_sources SET attachment_id=?,resolved_url=?,kind=?,state=?,updated_at=? WHERE id=?''',
+                                       (row['attachment_id'], row['resolved_url'], row['kind'], row['state'], now(), existing_source['id']))
+                        db.execute('DELETE FROM fulltext_sources WHERE id=?', (row['id'],))
+                    else:
+                        db.execute('UPDATE fulltext_sources SET item_id=? WHERE id=?', (target_id, row['id']))
+                for row in db.execute('SELECT * FROM relation_session_items WHERE item_id=?', (source_id,)).fetchall():
+                    affected_sessions.add(row['session_id'])
+                    if db.execute('SELECT 1 FROM relation_session_items WHERE session_id=? AND item_id=?', (row['session_id'], target_id)).fetchone():
+                        db.execute('DELETE FROM relation_session_items WHERE session_id=? AND item_id=?', (row['session_id'], source_id))
+                    else:
+                        db.execute('UPDATE relation_session_items SET item_id=? WHERE session_id=? AND item_id=?', (target_id, row['session_id'], source_id))
+                for row in db.execute('SELECT * FROM writing_citation_items WHERE item_id=?', (source_id,)).fetchall():
+                    if db.execute('SELECT 1 FROM writing_citation_items WHERE cluster_id=? AND item_id=?', (row['cluster_id'], target_id)).fetchone():
+                        db.execute('DELETE FROM writing_citation_items WHERE cluster_id=? AND item_id=?', (row['cluster_id'], source_id))
+                    else:
+                        db.execute('UPDATE writing_citation_items SET item_id=? WHERE cluster_id=? AND item_id=?', (target_id, row['cluster_id'], source_id))
+                for row in db.execute("SELECT * FROM research_project_links WHERE entity_type='item' AND entity_id=?", (source_id,)).fetchall():
+                    if db.execute("SELECT 1 FROM research_project_links WHERE project_id=? AND entity_type='item' AND entity_id=?", (row['project_id'], target_id)).fetchone():
+                        db.execute("DELETE FROM research_project_links WHERE project_id=? AND entity_type='item' AND entity_id=?", (row['project_id'], source_id))
+                    else:
+                        db.execute("UPDATE research_project_links SET entity_id=? WHERE project_id=? AND entity_type='item' AND entity_id=?", (target_id, row['project_id'], source_id))
+                for table in ('article_relations', 'manual_relations'):
+                    for row in db.execute(f'SELECT * FROM {table} WHERE left_item_id=? OR right_item_id=?', (source_id, source_id)).fetchall():
+                        left = target_id if row['left_item_id'] == source_id else row['left_item_id']
+                        right = target_id if row['right_item_id'] == source_id else row['right_item_id']
+                        collision = db.execute('''SELECT * FROM manual_relations WHERE session_id=? AND left_item_id=? AND right_item_id=? AND label=? AND id<>?''',
+                            (row['session_id'], left, right, row['label'], row['id'])).fetchone() if table == 'manual_relations' else None
+                        if collision:
+                            if row['note'] and row['note'] not in collision['note']:
+                                combined_note = (collision['note'] + '\n\n[合并来源 ' + source_id[:8] + ']\n' + row['note']).strip()
+                                db.execute('UPDATE manual_relations SET note=?,updated_at=? WHERE id=?', (combined_note, now(), collision['id']))
+                            db.execute('DELETE FROM manual_relations WHERE id=?', (row['id'],))
+                        else:
+                            db.execute(f'UPDATE {table} SET left_item_id=?,right_item_id=?,updated_at=? WHERE id=?', (left, right, now(), row['id']))
+                        affected_sessions.add(row['session_id'])
+                for table in ('relation_discoveries', 'relation_discovery_pages'):
+                    for row in db.execute(f'SELECT * FROM {table} WHERE anchor_item_id=?', (source_id,)).fetchall():
+                        identity = ('session_id', 'work_id', 'direction') if table == 'relation_discoveries' else ('session_id', 'direction')
+                        where = ' AND '.join(f'{key}=?' for key in identity)
+                        if db.execute(f'SELECT 1 FROM {table} WHERE anchor_item_id=? AND {where}', (target_id, *(row[key] for key in identity))).fetchone():
+                            db.execute(f'DELETE FROM {table} WHERE anchor_item_id=? AND {where}', (source_id, *(row[key] for key in identity)))
+                        else:
+                            db.execute(f'UPDATE {table} SET anchor_item_id=? WHERE anchor_item_id=? AND {where}', (target_id, source_id, *(row[key] for key in identity)))
+                db.execute('UPDATE relation_discovery_decisions SET anchor_item_id=? WHERE anchor_item_id=?', (target_id, source_id))
+                target_profile = db.execute('SELECT id FROM article_profiles WHERE item_id=?', (target_id,)).fetchone()
+                source_profile = db.execute('SELECT id FROM article_profiles WHERE item_id=?', (source_id,)).fetchone()
+                if source_profile and target_profile:
+                    db.execute('UPDATE article_profile_evidence SET profile_id=? WHERE profile_id=?', (target_profile['id'], source_profile['id']))
+                    db.execute('DELETE FROM article_profiles WHERE id=?', (source_profile['id'],))
+                elif source_profile:
+                    db.execute('UPDATE article_profiles SET item_id=? WHERE id=?', (target_id, source_profile['id']))
                 db.execute('INSERT OR IGNORE INTO collection_items SELECT collection_id,? FROM collection_items WHERE item_id=?', (target_id, source_id))
                 db.execute('UPDATE items SET deleted_at=?,revision=revision+1,updated_at=? WHERE id=?', (now(), now(), source_id))
+            for row in snapshot['research_conversations']:
+                item_ids = [target_id if item_id in source_ids else item_id for item_id in json.loads(row['item_ids_json'])]
+                db.execute('UPDATE research_conversations SET item_ids_json=?,updated_at=? WHERE id=?',
+                           (dumps(list(dict.fromkeys(item_ids))), now(), row['id']))
+            for session_id in affected_sessions:
+                db.execute("UPDATE relation_sessions SET state='stale',updated_at=? WHERE id=? AND state NOT IN ('running','queued')", (now(), session_id))
             self._update(db, target_id, {'tags': list(dict.fromkeys(combined_tags))}, target['revision'])
+            for source_id in source_ids:
+                self._index(db, source_id)
             event_id = uid()
+            snapshot['postRevisions'] = {}
+            for table in ('terms', 'reading_cards', 'reading_sessions'):
+                original_ids = {record['id'] for record in snapshot[table]}
+                snapshot['postRevisions'][table] = {row['id']: row['revision'] for row in db.execute(f'SELECT id,revision FROM {table}')
+                                                     if row['id'] in original_ids}
+            cluster_ids = {row['cluster_id'] for row in snapshot['writing_citation_items']}
+            snapshot['wordPost'] = [dict(row) for row in db.execute('SELECT * FROM writing_citation_items') if row['cluster_id'] in cluster_ids]
             snapshot.update(targetId=target_id, sourceIds=source_ids, expectedRevisions={row['id']: row['revision'] + 1 for row in snapshot['items']})
             db.execute('INSERT INTO merge_events VALUES(?,?,0,?)', (event_id, dumps(snapshot), now()))
         return {'id': event_id, 'item': self.get(target_id)}
@@ -771,13 +995,110 @@ class Library:
             snapshot = json.loads(event['data'])
             for item_id, revision in snapshot['expectedRevisions'].items():
                 require(self._get(db, item_id)['revision'] == revision, '合并后条目已编辑，请先手动核对再拆分')
-            for table in ('attachments', 'notes', 'provenance'):
+            for table, revisions in snapshot.get('postRevisions', {}).items():
+                for row_id, revision in revisions.items():
+                    current = db.execute(f'SELECT revision FROM {table} WHERE id=?', (row_id,)).fetchone()
+                    require(current and current['revision'] == revision, '合并后阅读卡、进度或术语已编辑，不能自动撤销')
+            if 'wordPost' in snapshot:
+                cluster_ids = {row['cluster_id'] for row in snapshot['writing_citation_items']}
+                current_word = [dict(row) for row in db.execute('SELECT * FROM writing_citation_items') if row['cluster_id'] in cluster_ids]
+                require(current_word == snapshot['wordPost'], '合并后 Word 引文已变更，不能自动撤销')
+            for table in ('attachments', 'notes', 'provenance', 'assistant_runs', 'document_chunks',
+                          'relation_evidence', 'article_profile_evidence', 'import_entries'):
                 for record in snapshot.get(table, []):
-                    current = db.execute(f'SELECT * FROM {table} WHERE id=?', (record['id'],)).fetchone()
+                    if record['item_id'] == snapshot['targetId']:
+                        continue
+                    identity = ('batch_id=? AND entry_key=?', (record['batch_id'], record['entry_key'])) if table == 'import_entries' else ('id=?', (record['id'],))
+                    current = db.execute(f'SELECT * FROM {table} WHERE {identity[0]}', identity[1]).fetchone()
                     require(current is not None, '合并后的附件或笔记已移除，不能自动撤销')
                     if table == 'notes':
                         require(current['revision'] == record['revision'], '合并后的笔记已编辑，不能自动撤销')
-                    db.execute(f'UPDATE {table} SET item_id=? WHERE id=?', (record['item_id'], record['id']))
+                    db.execute(f'UPDATE {table} SET item_id=? WHERE {identity[0]}', (record['item_id'], *identity[1]))
+            for record in snapshot.get('ai_search_candidates', []):
+                db.execute('UPDATE ai_search_candidates SET imported_item_id=? WHERE id=?', (record['imported_item_id'], record['id']))
+            for record in snapshot.get('terms', []):
+                if record['item_id'] != snapshot['targetId']:
+                    db.execute('UPDATE terms SET item_id=?,term=?,updated_at=? WHERE id=?',
+                               (record['item_id'], record['term'], now(), record['id']))
+            for table in ('reading_cards', 'reading_sessions'):
+                db.execute(f'DELETE FROM {table} WHERE item_id IN (' + ','.join('?' for _ in snapshot['expectedRevisions']) + ')',
+                           tuple(snapshot['expectedRevisions']))
+                for record in snapshot.get(table, []):
+                    columns = list(record)
+                    db.execute(f'INSERT INTO {table} (' + ','.join(columns) + ') VALUES (' + ','.join('?' for _ in columns) + ')',
+                               tuple(record[key] for key in columns))
+            original_target_links = {(row['session_id'], row['item_id']) for row in snapshot.get('relation_session_items', []) if row['item_id'] == snapshot['targetId']}
+            for record in snapshot.get('relation_session_items', []):
+                if record['item_id'] == snapshot['targetId']:
+                    continue
+                key = (record['session_id'], snapshot['targetId'])
+                if key not in original_target_links:
+                    moved = db.execute('UPDATE relation_session_items SET item_id=? WHERE session_id=? AND item_id=?',
+                                       (record['item_id'], record['session_id'], snapshot['targetId']))
+                    if moved.rowcount:
+                        original_target_links.add(key)
+                        continue
+                db.execute('INSERT OR IGNORE INTO relation_session_items(session_id,item_id,profile_version,ordinal) VALUES(?,?,?,?)',
+                           (record['session_id'], record['item_id'], record['profile_version'], record['ordinal']))
+            for table, columns in [('writing_citation_items', ('cluster_id', 'item_id')),
+                                   ('research_project_links', ('project_id', 'entity_type', 'entity_id'))]:
+                originals = snapshot.get(table, [])
+                target_keys = {tuple(row[key] for key in columns[:-1]) for row in originals if row[columns[-1]] == snapshot['targetId']}
+                for record in originals:
+                    if record[columns[-1]] == snapshot['targetId'] or (table == 'research_project_links' and record['entity_type'] != 'item'):
+                        continue
+                    prefix = tuple(record[key] for key in columns[:-1])
+                    where = ' AND '.join(f'{key}=?' for key in columns[:-1])
+                    if prefix not in target_keys:
+                        moved = db.execute(f'UPDATE {table} SET {columns[-1]}=? WHERE {where} AND {columns[-1]}=?',
+                                           (record[columns[-1]], *prefix, snapshot['targetId']))
+                        if moved.rowcount:
+                            target_keys.add(prefix)
+                            continue
+                    db.execute(f'INSERT OR IGNORE INTO {table} (' + ','.join(record) + ') VALUES (' + ','.join('?' for _ in record) + ')',
+                               tuple(record.values()))
+            for table in ('fulltext_sources', 'manual_relations', 'article_relations', 'relation_discovery_decisions'):
+                for record in snapshot.get(table, []):
+                    if table == 'fulltext_sources' and record['item_id'] == snapshot['targetId']:
+                        continue
+                    current = db.execute(f'SELECT id FROM {table} WHERE id=?', (record['id'],)).fetchone()
+                    if current:
+                        fields = tuple(field for field in record if field != 'id')
+                        db.execute(f'UPDATE {table} SET ' + ','.join(f'{field}=?' for field in fields) + ' WHERE id=?',
+                                   (*(record[field] for field in fields), record['id']))
+                    else:
+                        db.execute(f'INSERT INTO {table} (' + ','.join(record) + ') VALUES (' + ','.join('?' for _ in record) + ')',
+                                   tuple(record.values()))
+            for table in ('relation_discoveries', 'relation_discovery_pages'):
+                identity = ('session_id', 'work_id', 'direction') if table == 'relation_discoveries' else ('session_id', 'direction')
+                original_target = {tuple(row[key] for key in identity) for row in snapshot.get(table, []) if row['anchor_item_id'] == snapshot['targetId']}
+                for record in snapshot.get(table, []):
+                    if record['anchor_item_id'] == snapshot['targetId']:
+                        continue
+                    key = tuple(record[field] for field in identity)
+                    where = ' AND '.join(f'{field}=?' for field in identity)
+                    if key not in original_target:
+                        moved = db.execute(f'UPDATE {table} SET anchor_item_id=? WHERE anchor_item_id=? AND {where}',
+                                           (record['anchor_item_id'], snapshot['targetId'], *key))
+                        if moved.rowcount:
+                            original_target.add(key)
+                            continue
+                    db.execute(f'INSERT OR IGNORE INTO {table} (' + ','.join(record) + ') VALUES (' + ','.join('?' for _ in record) + ')',
+                               tuple(record.values()))
+            for record in snapshot.get('relation_discovery_imports', []):
+                db.execute('''UPDATE relation_discoveries SET imported_item_id=?
+                    WHERE session_id=? AND anchor_item_id=? AND work_id=? AND direction=?''',
+                    (record['imported_item_id'], record['session_id'], record['anchor_item_id'], record['work_id'], record['direction']))
+            for record in snapshot.get('article_profiles', []):
+                if db.execute('SELECT 1 FROM article_profiles WHERE id=?', (record['id'],)).fetchone():
+                    db.execute('UPDATE article_profiles SET item_id=? WHERE id=?', (record['item_id'], record['id']))
+                else:
+                    db.execute('INSERT INTO article_profiles (' + ','.join(record) + ') VALUES (' + ','.join('?' for _ in record) + ')', tuple(record.values()))
+            for record in snapshot.get('article_profile_evidence', []):
+                db.execute('UPDATE article_profile_evidence SET profile_id=? WHERE id=?', (record['profile_id'], record['id']))
+            for record in snapshot.get('research_conversations', []):
+                db.execute('UPDATE research_conversations SET item_ids_json=?,updated_at=? WHERE id=?',
+                           (record['item_ids_json'], now(), record['id']))
             for record in snapshot['items']:
                 db.execute('UPDATE items SET data=?,deleted_at=?,revision=revision+1,updated_at=? WHERE id=?', (record['data'], record['deleted_at'], now(), record['id']))
                 for table in ('collection_items', 'item_tags'):

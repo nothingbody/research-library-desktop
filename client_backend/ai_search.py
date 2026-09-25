@@ -18,7 +18,7 @@ import time
 from urllib import error, parse, request
 from xml.etree import ElementTree
 
-from .biblio import normalize
+from .biblio import author_name, csl_type, normalize
 from .common import AppError, bounded_int, doi, dumps, norm, now, require, uid
 from .search_evidence import infer, validate, fragments, screen, disposition, verified_model
 
@@ -62,13 +62,13 @@ def _authors(values):
     for value in values or []:
         if not isinstance(value, dict):
             continue
-        literal = _text(value.get('name') or value.get('collective') or value.get('literal'), 300)
-        if literal:
-            result.append({'literal': literal})
-            continue
         given, family = _text(value.get('given'), 200), _text(value.get('family'), 200)
         if given or family:
             result.append({key: item for key, item in {'given': given, 'family': family}.items() if item})
+            continue
+        literal = _text(value.get('name') or value.get('collective') or value.get('literal'), 300)
+        if literal:
+            result.append({'literal': literal} if value.get('collective') else author_name(literal))
     return result[:100]
 
 
@@ -80,6 +80,8 @@ class AiSearch:
         self._running = {}
         self._verifying = set()
         self._lock = threading.RLock()
+        self._request_locks = {source: threading.Lock() for source in SOURCES}
+        self._last_request = {}
 
     @staticmethod
     def _clean_sources(value):
@@ -139,9 +141,24 @@ class AiSearch:
                 query_pairs.append(('多车间视角', 'distributed flexible job shop scheduling'))
         if not query_pairs:
             english = ' '.join(word for word in terms if re.search(r'[a-z]', word))[:220].strip()
+            if not english:
+                vocabulary = [('大语言模型', 'large language model'), ('大模型', 'large language model'),
+                              ('机器学习', 'machine learning'), ('人工智能', 'artificial intelligence'),
+                              ('智慧物流', 'smart logistics'), ('供应链', 'supply chain'), ('物流', 'logistics'),
+                              ('柔性作业车间', 'flexible job shop'), ('作业车间', 'job shop'), ('调度', 'scheduling'),
+                              ('多目标', 'multi objective'), ('优化', 'optimization'), ('综述', 'review'),
+                              ('发展', 'development'), ('数字化', 'digital transformation')]
+                remaining, mapped = brief, []
+                for chinese, translation in vocabulary:
+                    if chinese in remaining:
+                        mapped.append(translation)
+                        remaining = remaining.replace(chinese, ' ')
+                english = ' '.join(dict.fromkeys(mapped))[:220]
             first_clause = re.split(r'[。；;\n]', brief, maxsplit=1)[0]
-            primary = _text(quoted[0] if quoted else english or first_clause, 220)
+            primary = _text(quoted[0] if quoted and re.search(r'[A-Za-z]{3}', quoted[0]) else english or first_clause, 220)
             query_pairs = [('核心问题', primary or 'research literature')]
+            if english and re.search(r'[\u3400-\u9fff]', brief):
+                query_pairs.append(('原文主题', _text(first_clause, 220)))
         for index, phrase in enumerate(quoted[:2], start=1):
             if re.search(r'[a-zA-Z]{3}', phrase) and not any(norm(phrase) == norm(q) for _, q in query_pairs):
                 query_pairs.append((f'用户术语 {index}', phrase))
@@ -302,6 +319,12 @@ class AiSearch:
         attempts, delay = 3, 1.0
         for attempt in range(attempts):
             req = request.Request(url, headers={'Accept': accept, 'User-Agent': 'ResearchLibrary/0.3 (local academic search)'})
+            interval = {'arxiv': 3.0, 'pubmed': 0.35, 'crossref': 1.0, 'openalex': 0.3}[source]
+            with self._request_locks[source]:
+                wait = interval - (time.monotonic() - self._last_request.get(source, 0))
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_request[source] = time.monotonic()
             try:
                 with request.urlopen(req, timeout=22) as response:
                     raw = response.read(4 * 1024 * 1024 + 1)
@@ -356,7 +379,7 @@ class AiSearch:
         return ' '.join(words[index] for index in sorted(words))[:20000]
 
     def _openalex(self, query, limit, offset=0):
-        params = {'search': query, 'per-page': str(limit), 'page': str(offset // limit + 1), 'select': 'id,doi,title,publication_year,authorships,primary_location,cited_by_count,open_access,type,abstract_inverted_index'}
+        params = {'search': query, 'per-page': str(limit), 'page': str(offset // limit + 1), 'select': 'id,doi,title,publication_year,authorships,primary_location,cited_by_count,open_access,type,abstract_inverted_index,biblio,ids'}
         # Polite pool: a configured contact address gets a separate, more generous quota.
         contact = str(self.library.get_settings().get('contactEmail') or '').strip()
         if re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', contact):
@@ -372,20 +395,24 @@ class AiSearch:
             for author in item.get('authorships') or []:
                 name = _text((author.get('author') or {}).get('display_name'), 300)
                 if name:
-                    authors.append({'literal': name})
+                    authors.append(author_name(name))
+            biblio = item.get('biblio') or {}
             records.append({'source': 'openalex', 'sourceId': _text(item.get('id'), 500), 'title': _text(item.get('title'), 1500),
                             'authors': authors, 'year': _year(item.get('publication_year')), 'venue': _text(source.get('display_name'), 600),
                             'issn': _text(source.get('issn_l') or next(iter(source.get('issn') or []), ''), 20),
                             'abstract': self._abstract_from_index(item.get('abstract_inverted_index')), 'doi': doi(item.get('doi')),
+                            'pmid': _text((item.get('ids') or {}).get('pmid'), 100).rstrip('/').rsplit('/', 1)[-1],
+                            'volume': _text(biblio.get('volume'), 50), 'issue': _text(biblio.get('issue'), 50),
+                            'page': '-'.join(filter(None, [_text(biblio.get('first_page'), 50), _text(biblio.get('last_page'), 50)])),
                             'url': _text((item.get('primary_location') or {}).get('landing_page_url') or item.get('id'), 1200),
                             'citationCount': int(item.get('cited_by_count') or 0), 'oaUrl': _text((item.get('open_access') or {}).get('oa_url'), 1200),
-                             'type': _text(item.get('type'), 100),
+                             'type': csl_type(item.get('type') or 'article-journal'),
                              'keywords': [_text(value.get('display_name'), 160) for value in (item.get('keywords') or [])
                                           if isinstance(value, dict) and _text(value.get('display_name'), 160)][:20], 'raw': item})
         return records
 
     def _crossref(self, query, limit, offset=0):
-        params = {'query.bibliographic': query, 'rows': str(limit), 'offset': str(offset), 'select': 'DOI,title,author,published-print,published-online,container-title,abstract,URL,type,is-referenced-by-count,link,ISSN'}
+        params = {'query.bibliographic': query, 'rows': str(limit), 'offset': str(offset), 'select': 'DOI,title,author,published-print,published-online,container-title,abstract,URL,type,is-referenced-by-count,link,ISSN,volume,issue,page'}
         data = self._json(SOURCE_ENDPOINTS['crossref'] + '?' + parse.urlencode(params), 'crossref')
         records = []
         for item in ((data.get('message') or {}).get('items') or []):
@@ -395,7 +422,11 @@ class AiSearch:
                             'issn': _text(next(iter(item.get('ISSN') or []), ''), 20),
                             'venue': _text((item.get('container-title') or [''])[0], 600), 'abstract': _text(item.get('abstract'), 20000),
                             'doi': doi(item.get('DOI')), 'url': _text(item.get('URL'), 1200), 'citationCount': int(item.get('is-referenced-by-count') or 0),
-                            'oaUrl': '', 'type': _text(item.get('type'), 100), 'raw': item})
+                            'oaUrl': '', 'fulltextLinks': [_text(link.get('URL'), 1200) for link in links
+                                if isinstance(link, dict) and 'pdf' in str(link.get('content-type', '')).lower() and link.get('URL')],
+                            'volume': _text(item.get('volume'), 50), 'issue': _text(item.get('issue'), 50),
+                            'page': re.sub(r'\s*--+\s*', '-', _text(item.get('page'), 100)),
+                            'type': csl_type(item.get('type') or 'article-journal'), 'raw': item})
         return records
 
     def _pubmed(self, query, limit, offset=0):
@@ -405,26 +436,37 @@ class AiSearch:
             return []
         summary_url = SOURCE_ENDPOINTS['pubmed'] + 'esummary.fcgi?' + parse.urlencode({'db': 'pubmed', 'id': ','.join(ids), 'retmode': 'json'})
         result = self._json(summary_url, 'pubmed').get('result') or {}
-        abstracts = self._pubmed_abstracts(ids)
+        abstract_error = ''
+        try:
+            abstracts = self._pubmed_abstracts(ids)
+        except AppError as exc:
+            # Preserve valid PubMed metadata, but report the missing abstract
+            # in the source run instead of silently treating it as evidence.
+            abstracts, abstract_error = {}, str(exc)[:300]
         records = []
         for identifier in ids:
             item = result.get(identifier) or {}
-            authors = [{'literal': _text(author.get('name'), 300)} for author in item.get('authors') or [] if _text(author.get('name'), 300)]
+            authors = []
+            for author in item.get('authors') or []:
+                name = _text(author.get('name'), 300)
+                if name:
+                    parts = name.split(None, 1)
+                    authors.append({'family': parts[0], 'given': parts[1]} if len(parts) > 1 else {'literal': name})
             article_ids = item.get('articleids') or []
             record_doi = next((doi(value.get('value')) for value in article_ids if value.get('idtype') == 'doi'), '')
             records.append({'source': 'pubmed', 'sourceId': str(identifier), 'title': _text(item.get('title'), 1500), 'authors': authors,
                             'year': _year(item.get('pubdate') or item.get('sortpubdate')), 'venue': _text(item.get('fulljournalname') or item.get('source'), 600),
                             'abstract': abstracts.get(str(identifier), ''), 'doi': record_doi, 'url': 'https://pubmed.ncbi.nlm.nih.gov/' + str(identifier) + '/',
-                            'citationCount': 0, 'oaUrl': '', 'type': 'article-journal', 'raw': item})
+                            'citationCount': 0, 'oaUrl': '', 'type': 'article-journal', 'pmid': str(identifier),
+                            'volume': _text(item.get('volume'), 50), 'issue': _text(item.get('issue'), 50),
+                            'page': re.sub(r'\s*--+\s*', '-', _text(item.get('pages'), 100)),
+                            'abstractFetchError': abstract_error, 'raw': item})
         return records
 
     def _pubmed_abstracts(self, ids):
-        """Fetch abstracts via efetch; esummary never includes them. Failures degrade to ''."""
+        """Fetch abstracts via efetch; failures surface as source errors."""
         fetch_url = SOURCE_ENDPOINTS['pubmed'] + 'efetch.fcgi?' + parse.urlencode({'db': 'pubmed', 'id': ','.join(ids), 'retmode': 'xml'})
-        try:
-            root = self._xml(fetch_url, 'pubmed')
-        except AppError:
-            return {}
+        root = self._xml(fetch_url, 'pubmed')
         abstracts = {}
         for article in root.iter('PubmedArticle'):
             pmid = (article.findtext('.//MedlineCitation/PMID') or '').strip()
@@ -446,23 +488,32 @@ class AiSearch:
         for item in root.findall(atom + 'entry'):
             source_id = _text(item.findtext(atom + 'id'), 1000)
             records.append({'source': 'arxiv', 'sourceId': source_id.rsplit('/', 1)[-1], 'title': _text(item.findtext(atom + 'title'), 1500),
-                            'authors': [{'literal': _text(author.findtext(atom + 'name'), 300)} for author in item.findall(atom + 'author') if _text(author.findtext(atom + 'name'), 300)],
+                            'authors': [author_name(_text(author.findtext(atom + 'name'), 300)) for author in item.findall(atom + 'author') if _text(author.findtext(atom + 'name'), 300)],
                             'year': _year(item.findtext(atom + 'published')), 'venue': 'arXiv', 'abstract': _text(item.findtext(atom + 'summary'), 20000),
                             'doi': doi(item.findtext('{http://arxiv.org/schemas/atom}doi')),
-                            'url': source_id, 'citationCount': 0, 'oaUrl': source_id, 'type': 'article', 'raw': {'id': source_id}})
+                            'url': source_id, 'citationCount': 0, 'oaUrl': source_id, 'type': 'manuscript', 'raw': {'id': source_id}})
         return records
 
     def _source_records(self, source, queries, limit, offset=0):
         method = getattr(self, '_' + source)
         records = []
         seen = set()
+        received = 0
         for query in queries:
-            for record in method(query, limit, offset):
+            page = method(query, limit, offset)
+            received += len(page)
+            for record in page:
                 key = record.get('doi') or record.get('sourceId') or norm(record.get('title'))
                 if key and key not in seen and record.get('title'):
                     seen.add(key)
                     records.append(record)
-        return records
+        return records, received
+
+    @staticmethod
+    def _source_page(value):
+        # Older adapters and local test doubles return records alone.
+        # Live adapters also supply the unfiltered count for cursor progress.
+        return value if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], int) else (value, len(value))
 
     @staticmethod
     def _canonical_key(record):
@@ -524,7 +575,7 @@ class AiSearch:
 
     @staticmethod
     def _merge(variants):
-        fields = ['title', 'authors', 'year', 'venue', 'issn', 'abstract', 'keywords', 'doi', 'url', 'citationCount', 'oaUrl', 'type']
+        fields = ['title', 'authors', 'year', 'venue', 'issn', 'abstract', 'keywords', 'doi', 'pmid', 'volume', 'issue', 'page', 'url', 'citationCount', 'oaUrl', 'fulltextLinks', 'type']
         result, provenance = {}, {}
         ranks = {'crossref': 0, 'pubmed': 1, 'openalex': 2, 'arxiv': 3}
         for field in fields:
@@ -533,7 +584,7 @@ class AiSearch:
                 priority = (0 if v['source'] == 'openalex' else 1) if field in ('citationCount', 'oaUrl') else ranks.get(v['source'], 9)
                 return (priority, v['source'], str(v.get('sourceId', '')))
             options.sort(key=order)
-            result[field] = options[0][field] if options else ([] if field in ('authors', 'keywords') else None if field == 'year' else 0 if field == 'citationCount' else '')
+            result[field] = options[0][field] if options else ([] if field in ('authors', 'keywords', 'fulltextLinks') else None if field == 'year' else 0 if field == 'citationCount' else '')
             provenance[field] = {'chosenSource': options[0]['source'] if options else None,
                                  'values': [{'value': v[field], 'source': v['source'], 'retrievedAt': v.get('retrievedAt')} for v in options]}
         result['fieldSources'] = provenance
@@ -569,8 +620,8 @@ class AiSearch:
                 if old.get('introZh'):
                     data['introZh'] = old['introZh']
                 # Update the global cache from merged values; current candidates always read their own snapshot.
-                db.execute('UPDATE ai_search_works SET title=?,title_norm=?,authors_json=?,year=?,venue=?,abstract=?,doi=?,url=?,citation_count=?,oa_url=?,type=?,updated_at=? WHERE id=?',
-                           (merged['title'], norm(merged['title']), dumps(merged['authors']), merged['year'], merged['venue'], merged['abstract'], merged['doi'], merged['url'], merged['citationCount'], merged['oaUrl'], merged['type'], now(), work_id))
+                db.execute('UPDATE ai_search_works SET title=?,title_norm=?,authors_json=?,year=?,venue=?,abstract=?,doi=?,pmid=?,url=?,citation_count=?,oa_url=?,type=?,meta_json=?,updated_at=? WHERE id=?',
+                           (merged['title'], norm(merged['title']), dumps(merged['authors']), merged['year'], merged['venue'], merged['abstract'], merged['doi'], merged['pmid'], merged['url'], merged['citationCount'], merged['oaUrl'], merged['type'], dumps({key: merged[key] for key in ('volume', 'issue', 'page', 'fulltextLinks')}), now(), work_id))
                 if existing:
                     db.execute('UPDATE ai_search_candidates SET score=?,tier=?,explanation=?,evidence_json=?,updated_at=? WHERE id=?', (score, tier, explanation, dumps(evidence), now(), candidate_id))
                 else:
@@ -672,21 +723,26 @@ class AiSearch:
                 count, received, failures, successful = 0, 0, [], 0
                 for query in queries:
                     check()
+                    if source in ('arxiv', 'pubmed') and not re.search(r'[A-Za-z]{3}', query['query']):
+                        failures.append({'query': query['query'], 'message': '该英文索引需要英文检索词；已跳过中文检索式'})
+                        continue
                     qid, started = uid(), time.monotonic()
                     with self.library.db(True) as db:
                         db.execute('INSERT INTO search_query_runs(id,run_id,source,query,state) VALUES(?,?,?,?,?)', (qid, run_id, source, query['query'], 'running'))
                         db.execute("UPDATE ai_search_source_runs SET state='running',query=?,message=?,started_at=? WHERE session_id=? AND source=?", (query['query'], '正在查询 ' + query['label'], now(), session_id, source))
                     try:
-                        records = self._source_records(source, [query['query']], per_source)
+                        records, page_size = self._source_page(self._source_records(source, [query['query']], per_source))
                         check()
+                        abstract_errors = {record.get('abstractFetchError') for record in records if record.get('abstractFetchError')}
+                        failures.extend({'query': query['query'], 'message': '摘要获取失败：' + message} for message in abstract_errors)
                         count += self._store_source(session, source, records)
                         received += len(records)
                         successful += 1
                         with self.library.db(True) as db:
-                            db.execute("UPDATE search_query_runs SET state='completed',received=?,truncated=?,elapsed_ms=? WHERE id=?", (len(records), int(len(records) >= per_source), int((time.monotonic()-started)*1000), qid))
+                            db.execute("UPDATE search_query_runs SET state='completed',received=?,truncated=?,elapsed_ms=? WHERE id=?", (page_size, int(page_size >= per_source), int((time.monotonic()-started)*1000), qid))
                             db.execute('''INSERT INTO search_source_cursors(run_id,query_run_id,source,query,next_offset,page_size,has_more,updated_at)
-                                VALUES(?,?,?,?,?,?,?,?)''', (run_id, qid, source, query['query'], len(records), per_source,
-                                int(len(records) >= per_source), now()))
+                                VALUES(?,?,?,?,?,?,?,?)''', (run_id, qid, source, query['query'], page_size, per_source,
+                                int(page_size >= per_source), now()))
                     except Exception as exc:
                         if getattr(exc, 'code', '') == 'CANCELLED':
                             raise
@@ -775,30 +831,26 @@ class AiSearch:
                     WHERE run_id=? AND has_more=1 AND next_offset<300 ORDER BY updated_at,source,query_run_id LIMIT ?''',
                     (run_id, payload['pageBudget']))]
                 db.execute("UPDATE ai_search_sessions SET state='expanding',updated_at=? WHERE id=?", (now(), session_id))
-            last_call = {}
-            delays = {'arxiv': 3.0, 'crossref': 1.0, 'pubmed': .4, 'openalex': .3}
             for index, cursor in enumerate(cursors):
                 if event.is_set():
                     raise AppError('CANCELLED', '扩展检索已取消')
                 require(self.library.get_settings().get('online', True), '联网已关闭，检索已停止')
                 source, offset = cursor['source'], cursor['next_offset']
-                wait = delays[source] - (time.monotonic() - last_call.get(source, 0))
-                if wait > 0 and event.wait(wait):
-                    raise AppError('CANCELLED', '扩展检索已取消')
-                last_call[source] = time.monotonic()
                 limit = min(cursor['page_size'], 300 - offset)
                 try:
-                    records = self._source_records(source, [cursor['query']], limit, offset)
+                    records, page_size = self._source_page(self._source_records(source, [cursor['query']], limit, offset))
                     if event.is_set():
                         raise AppError('CANCELLED', '扩展检索已取消')
+                    failures.extend({'source': source, 'query': cursor['query'], 'message': '摘要获取失败：' + message}
+                                    for message in {record.get('abstractFetchError') for record in records if record.get('abstractFetchError')})
                     accepted += self._store_source(session, source, records)
-                    next_offset = offset + len(records)
-                    has_more = len(records) == limit and next_offset < 300
+                    next_offset = offset + page_size
+                    has_more = page_size == limit and next_offset < 300
                     with self.library.db(True) as db:
                         db.execute('''UPDATE search_source_cursors SET next_offset=?,has_more=?,error='',updated_at=?
                             WHERE run_id=? AND query_run_id=?''', (next_offset, int(has_more), now(), run_id, cursor['query_run_id']))
                         db.execute('''UPDATE search_query_runs SET received=received+?,truncated=? WHERE id=?''',
-                                   (len(records), int(has_more), cursor['query_run_id']))
+                                   (page_size, int(has_more), cursor['query_run_id']))
                     completed += 1
                 except Exception as exc:
                     if getattr(exc, 'code', '') == 'CANCELLED':
@@ -920,7 +972,7 @@ class AiSearch:
         session_id, run_id = payload['sessionId'], payload['runId']
         session = self.get(session_id)
         require(session['activeRunId'] == run_id, '检索版本已更新')
-        records = self.results({'sessionId': session_id, 'limit': 20, 'sort': 'score'})['items']
+        records = self.results({'sessionId': session_id, 'limit': 20, 'sort': 'screening'})['items']
         require(records, '当前没有可重排的候选')
         context = {'question': session['brief'], 'criteria': session['plan'].get('criteria', []),
                    'papers': [{'candidateId': r['id'], 'title': r['title'], 'abstract': (r.get('abstract') or '')[:1200]}
@@ -1174,7 +1226,9 @@ class AiSearch:
         collection_id = payload.get('collectionId') or None
         imported, existing, missing = [], [], []
         def remember_sources(db, item_id, row):
-            for url, origin in ((row.get('oa_url'), 'oa'), (row.get('url'), 'record')):
+            links = [(row.get('oa_url'), 'oa'), (row.get('url'), 'record')]
+            links.extend((url, 'record') for url in row.get('fulltextLinks') or [])
+            for url, origin in links:
                 url = _text(url, 2000)
                 parts = parse.urlsplit(url)
                 if parts.scheme not in ('http', 'https') or not parts.hostname:
@@ -1196,7 +1250,7 @@ class AiSearch:
                 detail = db.execute('SELECT data_json FROM search_candidate_details WHERE candidate_id=?', (row['id'],)).fetchone()
                 if detail:
                     snap = json.loads(detail[0])
-                    row.update({k: snap[k] for k in ('title','year','venue','abstract','doi','url','type')})
+                    row.update({k: snap.get(k) for k in ('title','year','venue','abstract','doi','url','type','pmid','volume','issue','page','fulltextLinks')})
                     row['oa_url'] = snap.get('oaUrl', row['oa_url'])
                     row['authors_json'] = dumps(snap['authors'])
                     row['title_norm'] = norm(snap['title'])
@@ -1210,9 +1264,11 @@ class AiSearch:
                     remember_sources(db, existing_item['id'], row)
                     continue
                 issued = {'date-parts': [[row['year']]]} if row['year'] else {}
+                metadata = json.loads(row.get('meta_json') or '{}')
                 item = normalize({'title': row['title'], 'author': json.loads(row['authors_json']), 'issued': issued, 'container-title': row['venue'],
-                                  'abstract': row['abstract'], 'DOI': row['doi'], 'PMID': row['pmid'], 'URL': row['url'], 'citationCount': row['citation_count'],
-                                  'type': row['type'] or 'article-journal',
+                                  'abstract': row['abstract'], 'DOI': row['doi'], 'PMID': row.get('pmid') or '', 'URL': row['url'], 'citationCount': row['citation_count'],
+                                  'volume': row.get('volume') or metadata.get('volume') or '', 'issue': row.get('issue') or metadata.get('issue') or '',
+                                  'page': row.get('page') or metadata.get('page') or '', 'type': csl_type(row['type'] or 'article-journal'),
                                   'tags': ['AI 检索']})
                 item_id = self.library._create(db, item, collection_id, 'ai-search')
                 db.execute('UPDATE ai_search_candidates SET imported_item_id=?,updated_at=? WHERE id=?', (item_id, now(), row['id']))
