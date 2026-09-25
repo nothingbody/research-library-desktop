@@ -19,6 +19,7 @@ class Imports:
         for file_index, source in enumerate(paths):
             path = Path(source).resolve()
             try:
+                auto_importable = False
                 require(path.is_file(), '文件不存在')
                 require(path.stat().st_size <= 2 * 1024 ** 3, '文件超过2GB')
                 digest = sha256(path)
@@ -31,6 +32,8 @@ class Imports:
                             if reader.is_encrypted and not reader.decrypt(''):
                                 warning = 'PDF需要密码，题录暂取文件名'
                             else:
+                                require(len(reader.pages) > 0, 'PDF没有可阅读的页面')
+                                auto_importable = True
                                 metadata = reader.metadata or {}
                                 title = str(metadata.get('/Title') or '').strip()
                                 if title:
@@ -59,7 +62,8 @@ class Imports:
                             duplicate = {'title': seen_in_batch[match_key]['title'], 'batchKey': seen_in_batch[match_key]['key']}
                         seen_in_batch.setdefault(match_key, {'key': f'{file_index}:{index}', 'title': record['title']})
                         entries.append({'key': f'{file_index}:{index}', 'path': str(path), 'fileName': path.name, 'digest': digest,
-                                        'data': record, 'attachment': attachment, 'matchKey': match_key, 'warning': warning, 'duplicate': dict(duplicate) if duplicate else None})
+                                        'data': record, 'attachment': attachment, 'autoImportable': auto_importable,
+                                        'matchKey': match_key, 'warning': warning, 'duplicate': dict(duplicate) if duplicate else None})
             except Exception as exc:
                 errors.append({'fileName': path.name, 'message': str(exc)[:300]})
         batch_id = uid()

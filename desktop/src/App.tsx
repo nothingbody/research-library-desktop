@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useRef, useState, type ReactNode} from 'react';
+import {useCallback, useEffect, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode} from 'react';
 import {BookOpen, Books, FilePdf, Notebook, Compass, Folder, Plus, Clock, Circle, Star, Copy, Trash, Database, GearSix, MagnifyingGlass, Minus, Square, X, ArrowSquareOut, DotsThree, Tag, CheckCircle, ArrowsClockwise, Sparkle, List} from '@phosphor-icons/react';
 import {api, files, type Data, authorText, yearText, stateText, useErrorText} from './api';
 import {Modal, Empty, Busy, ErrorBox, Search, Pager} from './ui';
@@ -35,6 +35,8 @@ export default function App() {
   const [askSeed, setAskSeed] = useState<{itemId:string;question:string}|null>(null);
   const [compareId, setCompareId] = useState('');
   const [readingSidebarCollapsed, setReadingSidebarCollapsed] = useState(() => localStorage.getItem('readingSidebarCollapsed') !== 'false');
+  const [dragActive, setDragActive] = useState(false);
+  const dragDepth = useRef(0);
   useEffect(() => {localStorage.setItem('inspectorCollapsed', String(collapsed)); localStorage.setItem('tableColumns', JSON.stringify(columns)); localStorage.setItem('tableWidths', JSON.stringify(widths));}, [collapsed, columns, widths]);
   useEffect(() => {localStorage.setItem('readingSidebarCollapsed', String(readingSidebarCollapsed));}, [readingSidebarCollapsed]);
   function resizeColumn(event: any, key: string) {const x = event.clientX, width = widths[key]; const move = (e: PointerEvent) => setWidths(old => ({...old, [key]: Math.max(44, Math.min(300, width + e.clientX - x))})); const end = () => {window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', end);}; window.addEventListener('pointermove', move); window.addEventListener('pointerup', end); event.preventDefault();}
@@ -46,6 +48,21 @@ export default function App() {
   const close = useCallback(() => setModal(null), []);
   const run = useCallback(async (fn: () => Promise<any>, message?: string) => {try {const value = await fn(); if (message) notify(message); refresh(); return value;} catch (e) {fail(e); return null;}}, [fail, notify, refresh]);
   const importFiles = useCallback(async (itemId?: string) => {try {const preview = await files(itemId ? 'attach' : 'import', {itemId}); if (preview) setModal({type: 'import', preview});} catch(e) {fail(e);}}, [fail]);
+  const fileDrag = (event: ReactDragEvent) => Array.from(event.dataTransfer.types).includes('Files') || event.dataTransfer.files.length > 0;
+  function clearFileDrag() {dragDepth.current = 0; setDragActive(false);}
+  async function importDropped(fileList: FileList, targetCollection: string | null) {
+    if (!fileList.length) return;
+    try {
+      const preview = await window.research.dropped(Array.from(fileList));
+      nav('library', 'all', targetCollection);
+      if (preview.entries?.length && !preview.errors?.length && preview.entries.every((entry: Data) => entry.autoImportable)) {
+        await api('imports.commit', {batchId: preview.batchId, keys: preview.entries.map((entry: Data) => entry.key), collectionId: targetCollection});
+        notify(`已接收 ${preview.entries.length} 篇 PDF，正在导入并建立全文索引`);
+      } else {
+        setModal({type: 'import', preview, collectionId: targetCollection});
+      }
+    } catch (error) {fail(error);}
+  }
   useEffect(() => {const timer = setTimeout(() => {setQuery(q); setPage(1);}, 200); return () => clearTimeout(timer);}, [q]);
   useEffect(() => {if (!toast) return; const timer = setTimeout(() => setToast(''), 6500); return () => clearTimeout(timer);}, [toast]);
   useEffect(() => window.research.on((event, data) => {
@@ -91,10 +108,17 @@ export default function App() {
   const title = collection ? collections.find(c => c.id === collection)?.name || '集合' : ({all: '我的文献', recent: '最近添加', unread: '未读文献', starred: '星标文献', trash: '回收站', duplicates: '重复条目'} as Data)[view];
   function tree(parent: string | null, depth = 0): ReactNode {return collections.filter(c => c.parentId === parent).map(c => <div key={c.id}><div className={'tree-row ' + (collection === c.id ? 'active' : '')} style={{paddingLeft: 13 + depth * 17}}><button onClick={() => nav('library', 'all', c.id)}><Folder size={18}/><span>{c.name}</span><small>{c.count}</small></button><button className="icon tree-more" aria-label={'管理集合 ' + c.name} onClick={() => setModal({type: 'collection', value: c})}><DotsThree/></button></div>{tree(c.id, depth + 1)}</div>);}
     const activeReader = tabs.find(t => t.id === activeTab);
-  return <div className={"desktop-shell " + (collapsed ? "inspector-collapsed " : "") + (activeReader && readingSidebarCollapsed ? "reading-sidebar-collapsed" : "")} style={{"--inspector": collapsed ? "0px" : undefined} as any} onDragOver={e => {if (e.dataTransfer.types.includes('Files')) e.preventDefault();}} onDrop={async e => {if (e.dataTransfer.files.length) {e.preventDefault(); try {setModal({type: 'import', preview: await window.research.dropped(e.dataTransfer.files)});} catch(e) {fail(e);}}}}>
+  return <div className={"desktop-shell " + (collapsed ? "inspector-collapsed " : "") + (activeReader && readingSidebarCollapsed ? "reading-sidebar-collapsed" : "")} style={{"--inspector": collapsed ? "0px" : undefined} as any}
+    onDragEnter={e => {if (fileDrag(e)) {dragDepth.current += 1; setDragActive(true);}}}
+    onDragLeave={() => {if (dragDepth.current) {dragDepth.current -= 1; if (!dragDepth.current) setDragActive(false);}}}
+    onDragOver={e => {if (fileDrag(e)) {e.preventDefault(); e.dataTransfer.dropEffect = 'copy';}}}
+    onDrop={e => {if (fileDrag(e)) {e.preventDefault(); clearFileDrag(); void importDropped(e.dataTransfer.files, module === 'library' ? collection : null);}}}>
+    {dragActive && <div className="library-drop-overlay" aria-hidden="true"><div><FilePdf size={38}/><strong>松开以添加到我的文献</strong><span>PDF 直接导入；BibTeX、RIS、CSL JSON 先核对题录</span></div></div>}
     <header className="titlebar"><div className="brandmark"><img src={brandLogo} alt="文献工作台"/></div><span>文献工作台</span><small>个人科研空间</small><div className="window-actions"><button aria-label="最小化" onClick={() => window.research.window('minimize')}><Minus/></button><button aria-label="最大化" onClick={() => window.research.window('maximize')}><Square size={13}/></button><button aria-label="关闭" onClick={() => window.research.window('close')}><X/></button></div></header>
     <div className="app-body"><aside className="sidebar"><div className="sidebar-heading">文献库<span className="local-pill">本地</span></div><nav>
-      <button className={'nav-item ' + (module === 'library' && view === 'all' && !collection ? 'active' : '')} onClick={() => nav('library')}><Books/>我的文献<span>{stats.items?.toLocaleString()}</span></button>
+      <button className={'nav-item library-drop-target ' + (module === 'library' && view === 'all' && !collection ? 'active ' : '') + (dragActive ? 'drag-active' : '')} onClick={() => nav('library')}
+        onDragOver={e => {if (fileDrag(e)) {e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = 'copy';}}}
+        onDrop={e => {if (fileDrag(e)) {e.preventDefault(); e.stopPropagation(); clearFileDrag(); void importDropped(e.dataTransfer.files, null);}}}><Books/>我的文献<span>{stats.items?.toLocaleString()}</span></button>
       <button className={'nav-item ' + (module === 'aiSearch' ? 'active' : '')} onClick={() => nav('aiSearch')}><Sparkle/>AI 文献检索</button>
       <button className={'nav-item ' + (module === 'researchAsk' ? 'active' : '')} onClick={() => nav('researchAsk')}><Sparkle/>多文献问答</button>
       <button className={'nav-item ' + (module === 'researchWorkspace' ? 'active' : '')} onClick={() => nav('researchWorkspace')}><Folder/>研究整理</button>
@@ -125,7 +149,7 @@ export default function App() {
     {modal?.type === 'advanced' && <AdvancedSearch collections={collections} initial={filters.advanced} initialIds={filters.collectionIds||[]} close={close} notify={notify} apply={(rule,ids)=>{setCollection(null);setView('all');setFilters(old=>({...old,advanced:rule,collectionIds:ids}));setPage(1);close();}}/>}
     {modal?.type === 'tags' && <Modal title={'为 '+selected.length+' 篇文献添加标签'} close={close}><input aria-label="批量标签" style={{width:'100%'}} placeholder="多个标签使用逗号分隔" value={batchTags} onChange={e=>setBatchTags(e.target.value)}/><div className="dialog-actions"><button onClick={close}>取消</button><button className="primary" disabled={!batchTags.trim()} onClick={()=>bulk('addTags',batchTags.split(/[,，]/).map(s=>s.trim()).filter(Boolean)).then(r=>r&&close())}>添加标签</button></div></Modal>}
     {modal?.type === 'edit' && <ItemEditor item={modal.item} collectionId={collection} close={close} done={() => {close(); refresh(); notify('题录已保存');}} fail={fail}/>}
-    {modal?.type === 'import' && <ImportPreview preview={modal.preview} collections={collections} collectionId={collection} close={close} done={() => {close(); refresh(); notify('导入任务已开始，可在数据中心查看进度');}} fail={fail}/>}
+    {modal?.type === 'import' && <ImportPreview preview={modal.preview} collections={collections} collectionId={modal.collectionId ?? collection} close={close} done={() => {close(); refresh(); notify('导入任务已开始，可在数据中心查看进度');}} fail={fail}/>}
     {modal?.type === 'metadata' && <MetadataDialog item={modal.item} collectionId={collection} close={close} done={() => {close(); refresh(); notify('元数据已保存');}} fail={fail}/>}
     {modal?.type === 'citation' && <CitationDialog ids={modal.ids} close={close} notify={notify} fail={fail}/>}
     {modal?.type === 'collection' && <CollectionDialog value={modal.value} collections={collections} close={close} done={() => {close(); refresh();}} fail={fail}/>}
