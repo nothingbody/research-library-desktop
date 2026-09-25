@@ -1,0 +1,33 @@
+.relation-graph{position:relative;height:min(560px,calc(100vh - 450px));min-height:430px;overflow:hidden;border:1px solid #2a4169;border-radius:13px;background:radial-gradient(ellipse at 50% 45%,#1c345c 0%,#112440 53%,#0d1b31 100%);box-shadow:inset 0 0 70px #08172960,0 8px 24px #1c376b1b;color:#e7f0ff}
+.relation-graph svg{width:100%;height:100%;display:block;touch-action:none;cursor:grab}
+.relation-graph svg:active{cursor:grabbing}
+.relation-graph-toolbar{position:absolute;z-index:2;top:17px;left:20px;right:20px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;pointer-events:none}
+.relation-graph-toolbar strong{display:block;font-size:13px;font-weight:650;letter-spacing:.25px;color:#f0f6ff}
+.relation-graph-toolbar span{display:block;margin-top:5px;color:#93accd;font-size:10px}
+.relation-graph-zoom{display:flex;gap:4px;border:1px solid #637fa65e;background:#152b4bd9;padding:4px;border-radius:9px;pointer-events:auto}
+.relation-graph-zoom select{border:0;border-right:1px solid #637fa65e;background:#152b4b;color:#d6e7ff;font-size:10px;padding:0 5px;max-width:92px}
+.relation-graph-zoom button{display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:6px;background:transparent;color:#c3d7f5;padding:0;cursor:pointer}
+.relation-graph-zoom button:hover{background:#6f9cd031;color:#fff}
+.relation-graph-zoom svg{width:15px;height:15px;cursor:pointer}
+.relation-graph-edge{cursor:pointer;transition:opacity .18s ease}
+.relation-graph-edge:hover path:nth-child(2){stroke-width:4}
+.relation-graph-edge.faded,.relation-graph-node.faded{opacity:.16}
+.relation-graph-node{cursor:pointer;transition:opacity .18s ease}
+.relation-graph-node-index{fill:#ecf5ff;font-size:16px;font-weight:700;pointer-events:none}
+.relation-graph-node-label{fill:#e5efff;font-size:13px;font-weight:600;paint-order:stroke;stroke:#102341;stroke-width:3px;stroke-linejoin:round;pointer-events:none}
+.relation-graph-node-meta{fill:#9ab3d4;font-size:11px;paint-order:stroke;stroke:#102341;stroke-width:3px;pointer-events:none}
+.relation-graph-legend{position:absolute;left:18px;bottom:43px;display:flex;flex-wrap:wrap;gap:7px 13px;max-width:75%;pointer-events:none}
+.relation-graph-legend span{display:inline-flex;align-items:center;gap:5px;font-size:9px;color:#b4c9e6}
+.relation-graph-legend i,.relation-graph-focus i{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+.relation-graph-hint{position:absolute;left:18px;bottom:15px;font-size:9px;color:#7896b9;pointer-events:none}
+.relation-graph-focus{position:absolute;z-index:2;top:62px;right:18px;width:min(310px,44%);max-height:calc(100% - 126px);overflow:auto;background:#eaf1ffed;border:1px solid #c7d8ef;border-radius:10px;padding:15px;color:#29456d;box-shadow:0 14px 40px #06132970}
+.relation-graph-focus>button{position:absolute;top:8px;right:9px;padding:2px 5px;border:0;background:transparent;color:#6f85a7;font-size:20px}
+.relation-graph-focus>small{display:block;color:#6987b2;font-size:9px;margin-bottom:7px}
+.relation-graph-focus>strong{display:block;padding-right:16px;font-size:12px;line-height:1.55}
+.relation-graph-focus>div{display:flex;flex-direction:column;gap:5px;margin-top:11px}
+.relation-graph-focus>div button{display:flex;align-items:flex-start;gap:7px;padding:8px;border:1px solid #d1def0;border-radius:6px;background:#fff;color:#526b8c;font-size:9px;line-height:1.55;text-align:left;white-space:normal}
+.relation-graph-focus>div button:hover{border-color:#95b9e7;background:#f6faff}
+.relation-graph-focus>div i{margin-top:3px}
+.relation-graph-focus p{font-size:10px;line-height:1.6;color:#7187a7}
+@media(max-width:1080px){.relation-graph{height:560px;min-height:420px}.relation-graph-focus{width:min(310px,55%)}}
+@media(max-width:700px){.relation-graph{height:480px}.relation-graph-legend{max-width:calc(100% - 32px);bottom:47px}.relation-graph-hint{max-width:calc(100% - 32px);line-height:1.5}.relation-graph-focus{width:calc(100% - 36px);top:auto;bottom:88px;max-height:180px}}

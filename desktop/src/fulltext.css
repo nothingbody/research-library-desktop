@@ -1,0 +1,5 @@
+.fulltext-source{padding:9px 0;border-bottom:1px solid #e3e9f1;font-size:10px;color:#62738d}
+.fulltext-source small{display:block;color:#7287a2;line-height:1.5}
+.fulltext-source p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:5px 0}
+.fulltext-source .mini-actions{margin-top:6px;flex-wrap:wrap}
+.attachment-role{display:flex;align-items:center;gap:8px;font-size:11px;color:#7188a5;margin:8px 0}.attachment-role select{max-width:175px;padding:5px;border:1px solid #d8e2ee;border-radius:6px;background:#fff;color:#314967}

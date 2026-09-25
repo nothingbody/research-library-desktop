@@ -1,0 +1,7 @@
+.citation-expand{padding:11px;margin:12px 0;border:1px solid #dfe7f4;border-radius:7px;background:#f8faff}
+.citation-expand strong{font-size:12px;color:#425777}.citation-expand p{font-size:11px;color:#71839c;margin:5px 0}.citation-expand>div{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}.citation-expand button{font-size:11px;padding:6px}
+.citation-expand .citation-record{border-top:1px solid #dfe7f4;padding:9px 0}
+.citation-expand .citation-record strong{font-size:11px;color:#5b718a}
+.citation-expand .citation-record p{font-size:12px;color:#2d485a;line-height:1.5}
+.citation-expand .citation-record small{display:block;font-size:10px;line-height:1.5;color:#71839c}
+.citation-expand .citation-record button{margin-top:6px}

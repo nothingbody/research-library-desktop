@@ -1,0 +1,9 @@
+.journal-candidate-match{padding:11px;margin:12px 0;background:#eff7f5;border:1px solid #cce3db;border-radius:7px;color:#335d52}
+.journal-candidate-match strong{font-size:12px}.journal-candidate-match p{font-size:11px;margin:4px 0 8px}
+.journal-candidate-match button{font-size:11px;padding:5px 9px}
+.journal-metric{display:inline-block;max-width:100%;margin:3px 0;padding:4px 7px;border:1px solid #cde5d8;border-radius:5px;background:#eef8f1;color:#28664b;font-size:11px;line-height:1.4;white-space:normal}
+.journal-metric.unavailable{border-color:#e2e8e8;background:#f6f8f8;color:#738485}
+.research-matrix .journal-metric{margin:0}
+.search-v2 .research-matrix td:nth-child(2),.search-v2 .research-matrix th:nth-child(2){min-width:280px}
+.search-v2 .research-matrix td:nth-child(4),.search-v2 .research-matrix th:nth-child(4){min-width:180px}
+.search-v2 .research-matrix td:nth-child(5),.search-v2 .research-matrix th:nth-child(5){min-width:130px}

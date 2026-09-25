@@ -1,0 +1,8 @@
+.reader-body{position:relative}
+.reader-stage,.reader-single,.reader{min-width:0}
+.reader-selection-actions{position:absolute;z-index:20;top:10px;left:50%;transform:translateX(-50%);display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:5px;max-width:calc(100% - 16px);padding:6px;border:1px solid #d9e3f4;border-radius:9px;background:#fff;box-shadow:0 8px 24px #223b6329;white-space:nowrap}
+.reader-selection-actions span{padding:0 7px;color:#667994;font-size:12px}
+.reader-selection-actions button{padding:5px 8px;font-size:12px;border:0}
+.reader-selection-actions button svg{width:15px;height:15px}
+.reader-selection-quote{max-height:130px;overflow:auto;padding:12px;border-left:3px solid #8fa9e7;background:#f6f8fc;color:#40516d;white-space:pre-wrap}
+.reader-selection-note{display:block;width:100%;min-height:220px;margin-top:8px;resize:vertical}

@@ -1,0 +1,23 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="popup.css"></head><body>
+<header><span class="brand">文献工作台</span><h1>保存当前文献</h1><p>核对题录后，保存到本机文献库。</p></header>
+<main>
+  <section id="connection" hidden><p>请保持文献工作台桌面端运行，扩展会自动连接本机文献库。</p><button id="retry" type="button">重试连接</button></section>
+  <section id="record" hidden>
+    <label>文献类型<select id="type"><option value="article-journal">期刊论文</option><option value="paper-conference">会议论文</option><option value="thesis">学位论文</option><option value="book">图书</option><option value="webpage">网页</option><option value="document">其他文献</option></select></label>
+    <label>题名 <span class="required">*</span><textarea id="title" rows="2"></textarea></label>
+    <label>作者 <small>以分号分隔</small><input id="authors" placeholder="例如 Zhang, Wei; Li, Ming"></label>
+    <div class="row"><label>年份<input id="year" inputmode="numeric" maxlength="4"></label><label>DOI<input id="doi"></label></div>
+    <label>期刊 / 会议<input id="venue"></label>
+    <label>摘要<textarea id="abstract" rows="3"></textarea></label>
+    <p id="classification" class="classification" hidden></p>
+    <label>保存到<select id="collection"><option value="">我的文献</option></select></label>
+    <div class="row"><input id="new-collection" placeholder="新集合名称"><button id="create-collection" type="button">新建</button></div>
+    <label><span id="pdf-label">公开 PDF 地址</span><input id="pdf" type="url" placeholder="可留空"></label>
+    <p id="fulltext-note" class="fulltext-note"></p>
+    <label class="check"><input id="download" type="checkbox" checked>保存后下载并索引公开 PDF</label>
+    <label id="native-download-wrap" hidden>知网授权全文<select id="native-download"><option value="">仅保存题录</option></select><small>PDF 下载完成后自动解析并建立全文索引；CAJ 作为原始附件保存。</small></label>
+    <p id="duplicate" class="duplicate" hidden></p>
+    <p id="source" class="source"></p><button id="save" class="primary">保存到文献库</button>
+  </section>
+  <p id="message" role="status"></p>
+</main><script src="popup.js"></script></body></html>

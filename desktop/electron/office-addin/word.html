@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>文献工作台写作引用</title><link rel="stylesheet" href="taskpane.css">
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+</head>
+<body data-host="word"><main id="app">
+  <header><div><small>RESEARCH LIBRARY</small><h1>写作引用</h1></div><span id="connection" class="status">正在连接</span></header>
+  <section id="pairing" class="card"><h2>连接本地文献库</h2><p>在文献工作台“写作引用”页面查看六位配对码。配对信息只保留在当前任务窗格。</p><div class="inline"><input id="pair-code" inputmode="numeric" maxlength="6" placeholder="六位配对码"><button id="pair">连接</button></div></section>
+  <section id="writer" hidden>
+    <div class="document"><strong id="document-name">未命名文档</strong><select id="style"></select></div>
+    <label class="search"><span>检索本地文库</span><input id="query" placeholder="题名、作者、DOI 或引用键"></label>
+    <div id="results" class="results"></div><div id="selected" class="selected"></div>
+    <section class="annotation-panel"><strong>批注摘录</strong><div id="annotations" class="annotations muted">选择一篇文献后查看批注</div></section>
+    <section class="fields"><label>页码 / 定位<input id="locator" placeholder="例如 12 或 12–14"></label><label>前缀<input id="prefix" placeholder="例如 见"></label><label>后缀<input id="suffix" placeholder="例如 及其讨论"></label><label class="check"><input id="suppress-author" type="checkbox">隐藏作者</label></section>
+    <div class="actions"><button id="insert" class="primary">插入引文</button><button id="edit">编辑当前位置</button></div>
+    <div class="actions"><button id="bibliography">插入参考文献</button><button id="refresh">刷新全文</button></div>
+    <p id="notice" class="notice">引文与参考文献保存在当前文档中；文献数据始终保留在本机。</p>
+  </section>
+</main><script src="taskpane.js"></script></body>
+</html>

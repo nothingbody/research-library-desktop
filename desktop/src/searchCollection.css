@@ -1,0 +1,15 @@
+.search-save-target{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0;padding:10px 12px;background:#f1f7f4;border:1px solid #d7e8de;border-radius:8px}
+.search-save-target label{display:flex!important;align-items:center;gap:8px;margin:0!important;font-weight:600;color:#466c5e}
+.search-save-target select{min-width:190px;max-width:260px}
+.search-save-target form{display:flex;align-items:center;gap:7px;flex:1 1 280px}
+.search-v2 .search-save-target form input{width:180px;flex:1;min-width:130px}
+.search-save-target button{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.search-v2 .ai-result-card{grid-template-columns:20px minmax(0,1fr) 80px}
+.search-v2 .result-card-actions .save-action{border:1px solid #cfe6d8;border-radius:5px;background:#edf8f1;color:#2d7052;padding:4px 5px;text-align:center;width:100%}
+.paper-source-overview{display:grid;gap:10px;margin:14px 0}
+.paper-source-overview section{padding:12px;background:#f5f9f8;border:1px solid #dfeae5;border-radius:8px}
+.paper-source-overview h4{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 6px;font-size:13px;color:#355b4c}
+.paper-source-overview h4 small,.paper-source-overview section>small{font-size:11px;font-weight:400;color:#718681}
+.paper-source-overview p{margin:7px 0!important;white-space:pre-wrap}
+.paper-source-abstract{max-height:200px;overflow:auto}
+@media(min-width:1501px){.search-v2 .ai-evidence-panel{position:sticky;top:0;max-height:calc(100vh - 100px);overflow:auto}}

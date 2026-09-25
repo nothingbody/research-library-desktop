@@ -1,0 +1,3 @@
+.continuous-page{position:relative;flex:none;margin:0 auto 34px;background:white;box-shadow:0 3px 18px #2637502b;min-width:400px}
+.continuous-page canvas{display:block}.continuous-page .textLayer{position:absolute;inset:0}.continuous-page .annotation-layer{pointer-events:none}
+.continuous-page-number{position:absolute;bottom:-24px;left:0;width:100%;text-align:center;color:#7a88a0;font-size:11px}

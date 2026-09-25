@@ -1,0 +1,6 @@
+.relation-run-summary{margin:0 22px 12px;padding:9px 13px;border:1px solid #d8e5ef;border-radius:8px;background:#eef5f9;color:#4b6681;font-size:11px;line-height:1.6}
+.relation-evidence-list article button{margin-top:7px;padding:5px 9px;font-size:10px;color:#3d639a;background:#eef4ff;border:1px solid #d8e5fb;border-radius:6px}
+.relation-history-evidence{margin:12px 0;padding:10px 12px;border:1px solid #e0e6ef;border-radius:8px;background:#f6f8fc;color:#637895;font-size:10px}
+.relation-history-evidence summary{cursor:pointer;color:#486486;font-weight:600}
+.relation-history-evidence p{margin:8px 0 0;line-height:1.6;overflow-wrap:anywhere}
+@media(max-width:1080px){.relation-evidence-panel{display:block}}

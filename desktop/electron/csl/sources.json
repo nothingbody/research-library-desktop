@@ -1,0 +1,14 @@
+[
+  {
+    "file": "locales-zh-CN.xml",
+    "source": "https://raw.githubusercontent.com/citation-style-language/locales/master/locales-zh-CN.xml",
+    "sha256": "95cebc667f2da8fb5b9864e49941e3f867d59f79feba929bc58e8ed6bfd4d582",
+    "fetchedAt": "2026-09-21"
+  },
+  {
+    "file": "gb-t-7714-2015-numeric.csl",
+    "source": "https://raw.githubusercontent.com/citation-style-language/styles/master/china-national-standard-gb-t-7714-2015-numeric.csl",
+    "sha256": "d9cd04f94bc21a99dc320d0a2230d5a1fb47e3634c17c5820cf975c40db3c0c7",
+    "fetchedAt": "2026-09-21"
+  }
+]

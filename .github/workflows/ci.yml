@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Check publication contents
+        run: python scripts/publication_check.py
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-client.txt -r requirements-async.txt
+      - name: Test Python backend
+        run: python -X utf8 -m unittest discover -s tests_client
+      - name: Test collector
+        run: python -X utf8 -m unittest test_collect_scholay test_robust_collector test_partition_collector test_async_runtime
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+      - name: Test Electron main process
+        working-directory: desktop
+        run: npm run test:main
+      - name: Test journal presentation
+        working-directory: desktop
+        run: npm run test:journal
+      - name: Test search presentation
+        working-directory: desktop
+        run: npm run test:search
+      - name: Test writing integration
+        working-directory: desktop
+        run: npm run test:writing
+      - name: Test browser extension
+        working-directory: desktop
+        run: npm run test:browser
+      - name: Test PDF translation layout
+        working-directory: desktop
+        run: node --experimental-strip-types --test tests/translationLayout.test.mjs
+      - name: Build frontend
+        working-directory: desktop
+        run: npm run build

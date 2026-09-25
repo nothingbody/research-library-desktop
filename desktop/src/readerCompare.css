@@ -1,0 +1,14 @@
+.reader-stage{display:flex;flex:1;min-height:0;flex-direction:column}
+.desktop-shell.reading-sidebar-collapsed .app-body>.sidebar{display:none}
+.reader-compare-bar{display:flex;align-items:center;gap:10px;padding:6px 14px;border-bottom:1px solid var(--line);background:#f8faff;color:#61718c;font-size:12px}
+.reader-compare-bar .reader-sidebar-toggle{display:inline-flex;align-items:center;gap:5px;color:#526990;background:#fff;border:1px solid #dbe4f3}
+.reader-compare-bar .reader-sidebar-toggle svg{width:16px;height:16px}
+.reader-compare-bar select{max-width:min(420px,60vw);padding:5px 26px 5px 8px;font-size:12px}
+.reader-compare-bar button{padding:5px 9px;font-size:12px}
+.reader-single{display:flex;flex:1;min-height:0}
+.reader-compare-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);flex:1;min-height:0}
+.reader-compare-grid>.reader{min-width:0;border-right:1px solid #ced8e9}
+.reader-compare-grid .reader-nav,.reader-compare-grid .reader-annotations,.reader-compare-grid .reader-assistant{display:none}
+.reader-compare-grid .reader-toolbar{overflow-x:auto;overflow-y:hidden;gap:3px;padding:5px;scrollbar-width:thin}
+.reader-compare-grid .reader-toolbar>*{flex-shrink:0}
+.reader-compare-grid .pdf-scroll{padding:15px}
