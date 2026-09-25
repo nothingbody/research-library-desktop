@@ -40,11 +40,38 @@ export function MetadataDialog({item, collectionId, close, done, fail}: Common &
 }
 
 export function CitationDialog({ids, close, notify, fail}: {ids: string[]; close: () => void; notify: (message: string) => void; fail: (e: any) => void}) {
-  const [styles,setStyles] = useState<Data[]>([]), [language,setLanguage] = useState('zh-CN');
-  useEffect(()=>{api('citation.styles').then(setStyles).catch(fail);},[fail]);
+  const [styles, setStyles] = useState<Data[]>([]), [language, setLanguage] = useState('zh-CN');
   const [style, setStyle] = useState('gb-t-7714-2015'), [text, setText] = useState(''), [format, setFormat] = useState('bibtex');
-  useEffect(() => {let cancelled = false; api('citation.format', {ids, style, lang:language}).then(r => {if (!cancelled) setText(r.text);}).catch(fail); return () => {cancelled = true;};}, [ids, style, language, fail]);
-  return <Modal title={`引用与导出 · ${ids.length} 篇文献`} close={close} wide><div className="inline-form"><label>引文样式</label><select value={style} onChange={e => setStyle(e.target.value)}>{styles.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select><select aria-label="引用语言" value={language} onChange={e=>setLanguage(e.target.value)}><option value="zh-CN">中文</option><option value="en-US">English</option></select><button onClick={()=>files('citationStyle').then(r=>{if(r){api('citation.styles').then(setStyles);setStyle(r.id);}}).catch(fail)}>导入样式</button><button onClick={() => window.research.clipboard(text).then(() => notify('引用已复制')).catch(fail)}><Clipboard/>复制引用</button></div><pre className="citation-preview">{text || '正在生成引用…'}</pre><p className="muted">导出的题录可交给 Zotero、JabRef 或 Word 的文献工具继续使用。</p><div className="dialog-actions"><select aria-label="导出格式" value={format} onChange={e => setFormat(e.target.value)}><option value="bibtex">BibTeX</option><option value="biblatex">BibLaTeX</option><option value="ris">RIS</option><option value="json">CSL JSON</option></select><button className="primary" onClick={() => files('export', {ids, format}).then(r => r && notify('已导出至 ' + r.path)).catch(fail)}><DownloadSimple/>导出题录</button></div></Modal>;
+  const [browse, setBrowse] = useState(false), [styleQuery, setStyleQuery] = useState(''), [matches, setMatches] = useState<Data[]>([]);
+  const [styleError, setStyleError] = useState(''), [searching, setSearching] = useState(false), [installing, setInstalling] = useState('');
+  useEffect(() => {api('citation.styles').then(setStyles).catch(fail);}, [fail]);
+  useEffect(() => {let cancelled = false; api('citation.format', {ids, style, lang: language}).then(result => {if (!cancelled) setText(result.text);}).catch(fail); return () => {cancelled = true;};}, [ids, style, language, fail]);
+  useEffect(() => {
+    if (!browse || styleQuery.trim().length < 2) {setMatches([]); setStyleError(''); setSearching(false); return;}
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      setSearching(true); setStyleError('');
+      api('citation.searchStyles', {query: styleQuery}).then(result => {if (!cancelled) setMatches(result);})
+        .catch(error => {if (!cancelled) setStyleError(String(error?.message || error));})
+        .finally(() => {if (!cancelled) setSearching(false);});
+    }, 250);
+    return () => {cancelled = true; clearTimeout(timer);};
+  }, [browse, styleQuery]);
+  async function installStyle(match: Data) {
+    if (match.installedId) {setStyle(match.installedId); setBrowse(false); return;}
+    setInstalling(match.path); setStyleError('');
+    try {
+      const added = await api('citation.installStyle', {path: match.path});
+      setStyles(await api('citation.styles')); setStyle(added.id); setBrowse(false);
+      notify(`已安装引文样式：${added.name}`);
+    } catch (error: any) {setStyleError(String(error?.message || error));}
+    finally {setInstalling('');}
+  }
+  return <Modal title={`引用与导出 · ${ids.length} 篇文献`} close={close} wide>
+    <div className="inline-form"><label>引文样式</label><select value={style} onChange={event => setStyle(event.target.value)}>{styles.map(entry => <option key={entry.id} value={entry.id}>{entry.name}</option>)}</select><select aria-label="引用语言" value={language} onChange={event => setLanguage(event.target.value)}><option value="zh-CN">中文</option><option value="en-US">English</option></select><button onClick={() => setBrowse(value => !value)}>在线查找样式</button><button onClick={() => files('citationStyle').then(result => {if (result) {api('citation.styles').then(setStyles); setStyle(result.id);}}).catch(fail)}>导入 CSL 文件</button><button onClick={() => window.research.clipboard(text).then(() => notify('引用已复制')).catch(fail)}><Clipboard/>复制引用</button></div>
+    {browse && <div className="citation-style-browser"><label>搜索官方 CSL 样式库<input aria-label="搜索引文样式" value={styleQuery} onChange={event => setStyleQuery(event.target.value)} placeholder="输入样式或期刊英文名，如 nature、chicago" autoFocus/></label><p>样式来自 <button className="inline-link" onClick={() => window.research.external('https://citationstyles.org/')}>Citation Style Language</button> 项目，安装后保存在本机。期刊变体会使用其官方母样式。</p>{searching && <small>正在搜索…</small>}{styleError && <div className="error-box">{styleError}</div>}<div className="citation-style-results">{matches.map(match => <button key={match.path} disabled={!!installing} onClick={() => installStyle(match)}><strong>{match.name}</strong><small>{match.dependent ? '期刊变体' : '独立样式'} · {match.installedId ? '已安装' : installing === match.path ? '安装中…' : '点击安装'}</small></button>)}{styleQuery.trim().length >= 2 && !matches.length && !searching && !styleError && <small>未找到匹配样式，请换用期刊英文名或缩短关键词。</small>}</div></div>}
+    <pre className="citation-preview">{text || '正在生成引用…'}</pre><p className="muted">导出的题录可交给 Zotero、JabRef 或 Word 的文献工具继续使用。</p><div className="dialog-actions"><select aria-label="导出格式" value={format} onChange={event => setFormat(event.target.value)}><option value="bibtex">BibTeX</option><option value="biblatex">BibLaTeX</option><option value="ris">RIS</option><option value="json">CSL JSON</option></select><button className="primary" onClick={() => files('export', {ids, format}).then(result => result && notify('已导出至 ' + result.path)).catch(fail)}><DownloadSimple/>导出题录</button></div>
+  </Modal>;
 }
 
 export function CollectionDialog({value, collections, close, done, fail}: Common & {value: Data; collections: Data[]}) {

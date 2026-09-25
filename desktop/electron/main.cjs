@@ -6,6 +6,7 @@ const readline = require('node:readline');
 const {Readable} = require('node:stream');
 const mainLog = require('./main-log.cjs');
 const {startOfficeBridge, PORT: OFFICE_BRIDGE_PORT} = require('./office-bridge.cjs');
+const {createStyleCatalog} = require('./csl-catalog.cjs');
 const {Cite, plugins} = require('@citation-js/core');
 require('@citation-js/plugin-csl');
 require('@citation-js/plugin-bibtex');
@@ -18,7 +19,7 @@ protocol.registerSchemesAsPrivileged([{scheme: 'app', privileges: {standard: tru
 const project = path.resolve(__dirname, '../..');
 const launcherScheme = 'researchlibrary';
 mainLog.install(app.getPath('userData'), {captureConsole: true});
-let win, child, closing = false, sequence = 0, readyPromise, root, configPath, config = {}, officeBridge;
+let win, child, closing = false, sequence = 0, readyPromise, root, configPath, config = {}, officeBridge, styleCatalog;
 const pending = new Map();
 const allowed = new Set(('app.info library.stats library.reindex items.list items.get items.create items.update items.bulk items.deletePermanently items.duplicates items.latestMerge items.merge items.undoMerge collections.list collections.edit notes.list notes.save notes.history notes.delete attachments.get attachments.position attachments.download attachments.setRole annotations.list annotations.save annotations.delete annotations.excerpt annotations.search annotations.exportText reading.get reading.save reading.activity terms.list terms.save terms.delete assistant.status assistant.settings assistant.test assistant.run assistant.runs assistant.translation.page assistant.apply aiSearch.create aiSearch.list aiSearch.get aiSearch.savePlan aiSearch.run aiSearch.expand aiSearch.citationExpand aiSearch.citationLinks aiSearch.rerank aiSearch.journalMatch aiSearch.results aiSearch.evidence aiSearch.intro aiSearch.import aiSearch.cancel aiSearch.verify aiSearch.decision searchEvaluation.report searchEvaluation.save relations.profile.get relations.profile.run relations.create relations.list relations.get relations.diff relations.history relations.run relations.results relations.evidence relations.confirm relations.export relations.forItem relations.discover relations.discoveries relations.discoveryProgress relations.discoveryDecide relations.manualList relations.manualAdd relations.graphExport imports.commit jobs.list jobs.action journals.stats journals.list journals.get journals.catalog journals.link journals.related journals.ensure journals.index collector.control settings.get settings.save browser.status browser.importDownloaded writing.sessions writing.session writing.session.save writing.event comparison.list comparison.save metadata.lookup metadata.apply export.text fulltext.sources fulltext.add fulltext.obtain researchAsk.create researchAsk.list researchAsk.get researchAsk.send researchAsk.saveClaim projects.create projects.list projects.get projects.archive projects.link smartCollections.save smartCollections.list smartCollections.results').split(' '));
 
@@ -232,6 +233,9 @@ async function init() {
   if(fs.existsSync(customStyles)) for(const name of fs.readdirSync(customStyles).filter(n=>/^custom-[a-f0-9]{16}\.csl$/.test(n))) {
     try {const xml=fs.readFileSync(path.join(customStyles,name),'utf8'), id=name.slice(0,-4); csl.styles.add(id,xml);styleOptions.push({id,name:(/<title>([^<]+)<\/title>/.exec(xml)||[])[1]||id});} catch {}
   }
+  styleCatalog = createStyleCatalog({directory: customStyles, styles: csl.styles, options: styleOptions, Cite,
+    isOnline: async () => (await rpc('settings.get')).online !== false});
+  styleCatalog.restore();
   try {
     officeBridge = await startOfficeBridge({
       rpc,
@@ -261,6 +265,8 @@ async function init() {
       return officeBridge.status();
     }
     if (method === 'citation.styles') return styleOptions;
+    if (method === 'citation.searchStyles') return styleCatalog.search(params.query);
+    if (method === 'citation.installStyle') return styleCatalog.install(params.path);
     if (method === 'citation.format') {
       const items = await Promise.all(params.ids.map(id => rpc('items.get', {id})));
       const style = styleOptions.some(s=>s.id===params.style) ? params.style : 'apa';

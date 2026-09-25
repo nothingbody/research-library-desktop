@@ -10,3 +10,11 @@
 .library-drop-overlay strong{font-size:20px;color:#223b69}
 .library-drop-overlay span{font-size:13px;color:#71829f}
 .library-drop-target.drag-active{background:#dbe8ff;outline:2px dashed #7394e7;outline-offset:-3px}
+.citation-style-browser{margin:14px 0;padding:16px;border:1px solid #dce5f4;border-radius:9px;background:#f8faff}
+.citation-style-browser>label{display:flex;flex-direction:column;gap:8px;font-weight:600;color:#354665}
+.citation-style-browser input{width:100%;background:#fff}
+.citation-style-browser p{font-size:12px;color:#738199;margin:10px 0}
+.citation-style-results{max-height:210px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+.citation-style-results>button{min-width:0;display:flex;flex-direction:column;align-items:flex-start;text-align:left;white-space:normal;gap:3px;padding:9px 11px}
+.citation-style-results>button strong{font-size:12px;overflow-wrap:anywhere}
+.citation-style-results>button small{font-size:10px}

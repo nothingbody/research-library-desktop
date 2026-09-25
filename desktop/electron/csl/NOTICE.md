@@ -6,3 +6,5 @@ Bundled CSL assets originate from the Citation Style Language project.
 - Locale licensing: Creative Commons Attribution-ShareAlike 3.0 Unported, per the upstream locales repository.
 
 Retrieval date and SHA-256 hashes are recorded in sources.json. The application labels the style by its explicit 2015 edition; it does not assert that edition is the latest standard.
+
+The in-app style browser retrieves optional styles from the official [CSL style repository](https://github.com/citation-style-language/styles) on its v1.0.2 branch. These styles remain the work of their listed authors and contributors and are licensed CC BY-SA 3.0. Each downloaded CSL file keeps its upstream metadata and attribution; the application stores it only in the user's local profile.

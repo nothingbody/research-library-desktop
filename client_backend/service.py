@@ -102,7 +102,7 @@ class Application:
     def call(self, method, p):
         library, attachments = self.library, self.attachments
         routes = {
-            'app.info': lambda: {'version': '0.9.34', 'root': str(library.root), 'settings': library.get_settings()},
+            'app.info': lambda: {'version': '0.9.35', 'root': str(library.root), 'settings': library.get_settings()},
             'library.stats': library.stats,
             'library.reindex': lambda: self.jobs.create('library.index', {}),
             'items.list': lambda: library.query(p),
