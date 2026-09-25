@@ -52,6 +52,8 @@ exports.run = async ({win, rpc, root, project, app}) => {
     assert.equal(await run('!!document.querySelector(".ai-plan-panel")'), false);
     await until('document.querySelectorAll(".discovery-list tbody tr").length>0', 'public-source results', 90000);
     await until('!document.querySelector(".discovery-list tbody input").disabled', 'retrieval completion', 120000);
+    assert.equal(await run('document.querySelector(".discovery-requery input").value'), '大模型下的智慧物流发展综述');
+    assert.equal(await run('document.querySelector(".discovery-result-tools").open'), false);
     await capture('02-simple-results');
     await run(`document.querySelector('.discovery-paper button').click()`);
     await until('!!document.querySelector(".discovery-intro")', 'paper overview');
