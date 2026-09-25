@@ -1,7 +1,7 @@
 const apiRoot = 'http://127.0.0.1:28886/api/browser';
 const launcherUrl = 'researchlibrary://browser-capture';
 const element = id => document.getElementById(id);
-let token = '', pageUrl = '', duplicateTimer = 0, duplicateSequence = 0, nativeDownloads = [];
+let token = '', pageUrl = '', duplicateTimer = 0, duplicateSequence = 0, nativeDownloads = [], browserPdfUrl = '';
 function message(value, kind = '') {const node = element('message'); node.textContent = value; node.className = kind;}
 async function request(path, method = 'GET', body) {
   const response = await fetch(apiRoot + path, {method, headers: {'Content-Type': 'application/json', 'X-Research-Browser': token}, body: body ? JSON.stringify(body) : undefined});
@@ -88,18 +88,64 @@ function extract() {
     .map(meta => (meta.getAttribute('content') || '').trim()).filter(Boolean);
   const first = (...names) => names.flatMap(values)[0] || '';
   const rawDate = first('citation_date','citation_publication_date','citation_online_date','dc.date','prism.publicationdate','article:published_time');
+  const currentUrl = new URL(location.href);
+  const pathDoi = (() => {try {return (decodeURIComponent(currentUrl.pathname).match(/\/(?:article|articles|doi\/(?:full|abs|pdf|epdf))\/(10\.\d{4,9}\/[^/?#]+)/i) || [])[1] || '';} catch {return '';}})();
+  const queryDoi = /^10\.\d{4,9}\/\S+$/i.test(currentUrl.searchParams.get('id') || '') ? currentUrl.searchParams.get('id') : '';
+  const doi = (first('citation_doi','dc.identifier.doi','prism.doi') || pathDoi || queryDoi)
+    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i,'').trim();
   const pdf = first('citation_pdf_url','dc.identifier.pdf');
   const href = document.querySelector('link[type="application/pdf"]')?.href || '';
-  let pdfUrl = href;
-  if (pdf) {try {pdfUrl = new URL(pdf, location.href).href;} catch {pdfUrl = href;}}
+  let pdfUrl = '';
+  for (const value of [pdf, href]) {
+    try {if (value) {const candidate = new URL(value, location.href); if (/^https?:$/.test(candidate.protocol)) {pdfUrl = candidate.href; break;}}} catch {}
+  }
+  // Prefer the current article's official PDF control when metadata is absent.
+  // Reference lists and supplementary-file controls are not main PDFs.
+  const host = currentUrl.hostname.toLowerCase();
+  const isHost = domain => host === domain || host.endsWith('.' + domain);
+  const articleId = (currentUrl.pathname.match(/\/(?:articles|document)\/(PMC\d+|\d+)(?:\/|$)/i) || [])[1] || '';
+  const doiMatches = url => {try {return !!doi && decodeURIComponent(url.href).toLowerCase().includes(doi.toLowerCase());} catch {return false;}};
+  const mainArticleLink = link => !link.closest('aside, footer, [role="complementary"], [class*="reference" i], [id*="reference" i], [class*="related" i], [class*="recommend" i], [class*="supplement" i]');
+  const publisherPdf = [...document.querySelectorAll('a[href]')].filter(mainArticleLink).find(link => {
+    let url;
+    try {url = new URL(link.href, location.href);} catch {return false;}
+    if (!/^https?:$/.test(url.protocol)) return false;
+    const candidateHost = url.hostname.toLowerCase();
+    if (candidateHost !== host && !candidateHost.endsWith('.' + host) && !host.endsWith('.' + candidateHost)) return false;
+    let path;
+    try {path = decodeURIComponent(url.pathname).toLowerCase();} catch {return false;}
+    const label = cleanText(link.getAttribute('aria-label') || link.getAttribute('title') || link.textContent).toLowerCase();
+    if (/supplement|supporting|appendix|cover|graphical|附录|补充材料/i.test(label + ' ' + path)) return false;
+    if (isHost('link.springer.com')) return /\/content\/pdf\/.+\.pdf$/i.test(path) && doiMatches(url);
+    if (['onlinelibrary.wiley.com', 'tandfonline.com', 'journals.sagepub.com', 'pubs.acs.org', 'dl.acm.org'].some(isHost))
+      return /\/doi\/(?:pdf|epdf)\//.test(path) && doiMatches(url);
+    if (isHost('mdpi.com')) return /\/pdf\/?$/.test(path) && path.replace(/\/pdf\/?$/, '') === currentUrl.pathname.toLowerCase().replace(/\/$/, '');
+    if (isHost('frontiersin.org')) return /\/articles\/.+\/pdf\/?$/.test(path) &&
+      path.replace(/\/pdf\/?$/, '') === currentUrl.pathname.toLowerCase().replace(/\/(?:full|abstract)\/?$/, '');
+    if (isHost('journals.plos.org')) return /\/article\/file$/.test(path) &&
+      url.searchParams.get('type') === 'printable' && (url.searchParams.get('id') || '').toLowerCase() === doi.toLowerCase();
+    if (isHost('pmc.ncbi.nlm.nih.gov')) return !!articleId && path.includes(`/articles/${articleId.toLowerCase()}/pdf`) && /\bpdf\b/i.test(label);
+    if (isHost('academic.oup.com')) return /\/article-pdf\//.test(path) && /\bpdf\b/i.test(label);
+    if (isHost('cambridge.org')) {
+      const articleHash = currentUrl.pathname.split('/').filter(Boolean).at(-1)?.toLowerCase() || '';
+      return /^[a-f0-9]{32}$/.test(articleHash) && path.includes(`/content/view/${articleHash}/`) && /\.pdf(?:\/|$)/.test(path) && /\bpdf\b/i.test(label);
+    }
+    if (isHost('ieeexplore.ieee.org')) return !!articleId &&
+      (url.searchParams.get('arnumber') === articleId || path.includes(`/${articleId}-`)) && /\bpdf\b/i.test(label);
+    return false;
+  });
+  if (!pdfUrl && publisherPdf) pdfUrl = publisherPdf.href;
+  // MDPI's PDF control can be rendered after the extension reads the page.
+  // Its journal article route has a stable article-specific /pdf endpoint.
+  if (!pdfUrl && isHost('mdpi.com') && /^\/\d{4}-\d{4}\/\d+\/\d+\/\d+\/?$/.test(currentUrl.pathname))
+    pdfUrl = new URL(currentUrl.pathname.replace(/\/$/, '') + '/pdf', currentUrl).href;
   // ScienceDirect does not consistently expose citation_pdf_url. Its article
   // page holds a short-lived, article-specific /pdfft link instead. Only use
   // that link when the current article itself is visibly marked Open Access;
   // links in the reference list must never be mistaken for the main article.
-  const currentUrl = new URL(location.href);
   const scienceDirect = /(^|\.)sciencedirect\.com$/i.test(currentUrl.hostname);
   const pii = (currentUrl.pathname.match(/\/article\/pii\/([^/?#]+)/i) || [])[1] || '';
-  let fulltextNote = '';
+  let fulltextNote = pdfUrl ? '已识别当前论文的 PDF 入口；保存后会尝试下载，实际可用性以返回的 PDF 为准。' : '';
   if (scienceDirect && pii) {
     // The OA badge lives in ScienceDirect's article header, outside its
     // <article> body. Inspect <main> so translated and original pages work.
@@ -122,15 +168,30 @@ function extract() {
   }
   const arxiv = /^(?:www\.)?arxiv\.org$/i.test(new URL(location.href).hostname);
   const directPdf = /\.pdf(?:$|[?#])/i.test(location.pathname) || (arxiv && /^\/pdf\//i.test(location.pathname));
+  const detectedPdfUrl = directPdf ? location.href : pdfUrl;
   const authors = values('citation_author').length ? values('citation_author') : values('dc.creator');
   const year = (rawDate.match(/(?:19|20)\d{2}/) || [])[0] || '';
+  const recognizedJournal = !!pdfUrl && ['link.springer.com', 'onlinelibrary.wiley.com', 'tandfonline.com',
+    'journals.sagepub.com', 'pubs.acs.org', 'mdpi.com', 'frontiersin.org', 'journals.plos.org',
+    'pmc.ncbi.nlm.nih.gov', 'academic.oup.com', 'cambridge.org', 'sciencedirect.com'].some(isHost);
   const type = first('citation_conference_title') ? 'paper-conference' : first('citation_dissertation_institution') ? 'thesis' : first('citation_book_title') ? 'book' :
-    first('citation_journal_title') ? 'article-journal' : directPdf || (arxiv && !!first('citation_arxiv_id')) ? 'document' : 'webpage';
+    first('citation_journal_title') || recognizedJournal ? 'article-journal' : directPdf || (arxiv && !!first('citation_arxiv_id')) ? 'document' : 'webpage';
+  const browserPublisher = ['link.springer.com', 'onlinelibrary.wiley.com', 'tandfonline.com',
+    'journals.sagepub.com', 'pubs.acs.org', 'dl.acm.org', 'mdpi.com', 'academic.oup.com',
+    'ieeexplore.ieee.org', 'sciencedirect.com'].some(isHost);
+  let browserDownload = false;
+  if (detectedPdfUrl && browserPublisher) {
+    try {const pdfHost = new URL(detectedPdfUrl).hostname.toLowerCase();
+      browserDownload = pdfHost === host || pdfHost.endsWith('.' + host) || host.endsWith('.' + pdfHost);
+    } catch {}
+  }
   return {pageUrl: location.href, type, title: first('citation_title','dc.title','og:title') || document.title.replace(/\s+[|–-]\s+[^|–-]+$/, '').trim(),
-    authors, year, DOI: first('citation_doi','dc.identifier.doi','prism.doi').replace(/^https?:\/\/(?:dx\.)?doi\.org\//i,''),
+    authors, year, DOI: doi,
     venue: first('citation_journal_title','citation_conference_title','prism.publicationname'),
     abstract: first('citation_abstract','dc.description','description'),
-    pdfUrl: directPdf ? location.href : pdfUrl, fulltextNote, tags: [], nativeDownloads: []};
+    pdfUrl: detectedPdfUrl,
+    fulltextNote: browserDownload ? '已识别当前论文的 PDF 入口；浏览器会使用当前站点会话下载，完成后验证并导入。' : fulltextNote,
+    tags: [], nativeDownloads: [], browserDownload};
  }
 async function enrichCnkiDetail(detailUrl) {
   // This runs in the current CNKI tab's isolated world. It uses the browser's
@@ -181,6 +242,7 @@ async function currentPage() {
 }
 function fill(data) {
   nativeDownloads = Array.isArray(data.nativeDownloads) ? data.nativeDownloads : [];
+  browserPdfUrl = data.browserDownload ? data.pdfUrl : '';
   const classification = element('classification');
   classification.textContent = (data.tags || []).join(' · ');
   classification.hidden = !classification.textContent;
@@ -196,10 +258,10 @@ function fill(data) {
   element('venue').value = data.venue || '';
   element('abstract').value = data.abstract || '';
   element('pdf').value = data.pdfUrl || '';
-  element('pdf-label').textContent = data.pdfUrl ? '已识别的公开 PDF 地址' : '公开 PDF 地址';
+  element('pdf-label').textContent = data.pdfUrl ? '已识别的 PDF 入口' : 'PDF 地址';
   const fulltextNote = element('fulltext-note');
-  fulltextNote.textContent = data.fulltextNote || (data.pdfUrl ? '已识别公开 PDF；保存后会自动下载并建立全文索引。' : '未检测到公开 PDF；可留空，稍后在附件页添加。');
-  fulltextNote.className = data.pdfUrl ? 'fulltext-note success' : 'fulltext-note';
+  fulltextNote.textContent = data.fulltextNote || (data.pdfUrl ? '保存后会尝试下载并验证 PDF，再建立全文索引；需要登录的链接可能无法自动下载。' : '未检测到当前论文的 PDF 入口；可留空，稍后在附件页添加。');
+  fulltextNote.className = 'fulltext-note';
   element('download').checked = !!data.pdfUrl;
   element('download').disabled = !data.pdfUrl;
   element('source').textContent = '来源：' + pageUrl;
@@ -246,6 +308,14 @@ function downloadNative(choice, itemId) {
     resolve(response);
   }));
 }
+function downloadPublisher(pdfUrl, itemId) {
+  return new Promise((resolve, reject) => chrome.runtime.sendMessage({type: 'download-publisher', token, itemId, sourceUrl: pageUrl, url: pdfUrl, title: element('title').value.trim()}, response => {
+    const error = chrome.runtime.lastError;
+    if (error) return reject(Error(error.message));
+    if (!response?.ok) return reject(Error(response?.error || '无法启动浏览器 PDF 下载'));
+    resolve(response);
+  }));
+}
 async function showRecord() {
   element('connection').hidden = true; element('record').hidden = false;
   await collections();
@@ -283,18 +353,26 @@ element('save').addEventListener('click', async () => {
     const title = element('title').value.trim(); if (!title) throw Error('请填写题名');
     const year = element('year').value.trim(); if (year && !/^\d{4}$/.test(year)) throw Error('年份应为四位数字');
     const authors = element('authors').value.split(/[;；]/).map(value => value.trim()).filter(Boolean);
-    const pdfUrl = element('pdf').value.trim(); if (pdfUrl && !/^https?:\/\//i.test(pdfUrl)) throw Error('公开 PDF 地址应以 http(s) 开头');
+    const pdfUrl = element('pdf').value.trim(); if (pdfUrl && !/^https?:\/\//i.test(pdfUrl)) throw Error('PDF 地址应以 http(s) 开头');
+    const useBrowser = element('download').checked && pdfUrl === browserPdfUrl;
     const result = await request('/capture','POST',{pageUrl, collectionId: element('collection').value || null, pdfUrl,
-      downloadPdf: element('download').checked,
+      downloadPdf: element('download').checked, browserDownload: useBrowser,
       data: {type: element('type').value, title, author: authors, year, DOI: element('doi').value.trim(),
         'container-title': element('venue').value.trim(), abstract: element('abstract').value.trim(),
         tags: (element('classification').textContent || '').split(' · ').map(value => value.trim()).filter(Boolean)}});
     const selected = element('native-download').value;
     const nativeChoice = selected ? nativeDownloads[Number(selected.split(':')[1])] : null;
     if (nativeChoice) await downloadNative(nativeChoice, result.itemId);
+    let browserError = '';
+    if (useBrowser && !result.pdfAlreadyAttached && !result.downloadSkippedOffline) {
+      try {await downloadPublisher(pdfUrl, result.itemId);} catch (error) {browserError = error.message || '浏览器拒绝下载';}
+    }
     message((result.created ? '已保存新文献' : '文献已存在，已补充集合和来源') +
       (nativeChoice ? `；已交由浏览器使用当前知网授权下载 ${nativeChoice.format.toUpperCase()}，完成后会自动导入${nativeChoice.format === 'pdf' ? '并解析索引' : '为原件'}` :
-       result.downloadJobId ? '；公开 PDF 下载与索引任务已开始' : result.pdfAlreadyAttached ? '；PDF 已在文献库中' : result.downloadSkippedOffline ? '；联网已关闭，已记录 PDF 来源但未下载' : result.pdfSourceId ? '；已记录 PDF 来源' : ''),'success');
+       browserError ? `；PDF 下载未启动：${browserError}。PDF 来源已记录，可在桌面端重试。` :
+       result.pdfAlreadyAttached ? '；PDF 已在文献库中' : result.downloadSkippedOffline ? '；联网已关闭，已记录 PDF 来源但未下载' :
+       useBrowser ? '；已交由浏览器下载，完成后会自动验证、导入并建立索引' :
+       result.downloadJobId ? '；PDF 验证与下载任务已开始' : result.pdfSourceId ? '；已记录 PDF 来源' : ''), browserError ? 'error' : 'success');
     scheduleDuplicateCheck();
   } catch (error) {message(error.message,'error');} finally {button.disabled = false;}
 });

@@ -98,7 +98,8 @@ def capture(library, fulltext, payload):
     pdf_url = str(payload.get('pdfUrl') or '').strip()
     if pdf_url:
         pdf_url = public_url(pdf_url)
-    download = bool(pdf_url and payload.get('downloadPdf') and library.get_settings().get('online', True))
+    online = bool(library.get_settings().get('online', True))
+    download = bool(pdf_url and payload.get('downloadPdf') and online and not payload.get('browserDownload'))
     with library.db(True) as db:
         if collection_id:
             require(db.execute('SELECT 1 FROM collections WHERE id=?', (collection_id,)).fetchone(), '集合不存在')
@@ -126,7 +127,7 @@ def capture(library, fulltext, payload):
     job = fulltext.submit({'itemId': item_id, 'sourceId': source['id']}) if source and download and not already_attached else None
     return {'itemId': item_id, 'created': not bool(existing), 'collectionId': collection_id,
             'pdfSourceId': source['id'] if source else None, 'downloadJobId': job['jobId'] if job else None,
-            'pdfAlreadyAttached': already_attached, 'downloadSkippedOffline': bool(pdf_url and payload.get('downloadPdf') and not download),
+            'pdfAlreadyAttached': already_attached, 'downloadSkippedOffline': bool(pdf_url and payload.get('downloadPdf') and not online),
             'duplicateBasis': duplicate_basis}
 
 
@@ -139,6 +140,23 @@ def _authorized_cnki_url(value):
     require(host == 'cnki.net' or host.endswith('.cnki.net') or host == 'cnki.com.cn' or host.endswith('.cnki.com.cn'),
             '只接受知网官方授权下载地址')
     return url
+
+
+_PUBLISHER_HOSTS = ('link.springer.com', 'onlinelibrary.wiley.com', 'tandfonline.com',
+                    'journals.sagepub.com', 'pubs.acs.org', 'dl.acm.org', 'mdpi.com',
+                    'academic.oup.com', 'ieeexplore.ieee.org', 'sciencedirect.com')
+
+
+def _authorized_publisher_url(source, download):
+    page, pdf = public_url(source), public_url(download)
+    a, b = urlsplit(page), urlsplit(pdf)
+    require(a.scheme == b.scheme == 'https', '期刊下载地址必须使用 HTTPS')
+    source_host, pdf_host = a.hostname.lower(), b.hostname.lower()
+    require(any(source_host == host or source_host.endswith('.' + host) for host in _PUBLISHER_HOSTS),
+            '只接受已适配期刊站点的浏览器 PDF 下载')
+    require(source_host == pdf_host or source_host.endswith('.' + pdf_host) or pdf_host.endswith('.' + source_host),
+            'PDF 下载地址与当前期刊站点不匹配')
+    return page, pdf
 
 
 def _browser_download_path(value, suffix):
@@ -156,21 +174,34 @@ def _browser_download_path(value, suffix):
 
 
 def import_downloaded(library, fulltext, payload):
-    """Import a completed CNKI browser download without reading browser credentials."""
+    """Import a verified browser download without reading browser credentials."""
     require(isinstance(payload, dict), '浏览器下载信息不正确')
     item_id = str(payload.get('itemId') or '')
-    source_url = _authorized_cnki_url(payload.get('sourceUrl'))
+    download_url = str(payload.get('downloadUrl') or '').strip()
+    publisher = bool(download_url)
+    source_url, download_url = (_authorized_publisher_url(payload.get('sourceUrl'), download_url)
+                                if publisher else (_authorized_cnki_url(payload.get('sourceUrl')), ''))
     fmt = str(payload.get('format') or '').lower()
-    require(fmt in ('pdf', 'caj'), '仅支持导入知网 PDF 或 CAJ 原件')
+    require(fmt == 'pdf' if publisher else fmt in ('pdf', 'caj'), '浏览器下载格式不正确')
     path = _browser_download_path(payload.get('path'), fmt)
+    if publisher:
+        with library.db() as db:
+            require(db.execute('SELECT 1 FROM fulltext_sources WHERE item_id=? AND url=?',
+                               (item_id, download_url)).fetchone(), '该文献没有对应的 PDF 来源')
+    if fmt == 'pdf':
+        with path.open('rb') as stream:
+            require(b'%PDF-' in stream.read(1024), '浏览器下载的文件不是 PDF；可能是登录页或站点拦截页')
     added = fulltext.downloads.attachments.add(item_id, path, mode='managed', role='main')
     job = None
     if fmt == 'pdf' and not added.get('duplicate'):
         job = fulltext.jobs.create('pdf.index', {'attachmentId': added['id']})
     with library.db(True) as db:
+        if publisher:
+            db.execute('''UPDATE fulltext_sources SET state='attached',attachment_id=?,resolved_url=?,kind='pdf',error='',checked_at=?,updated_at=?
+                WHERE item_id=? AND url=?''', (added['id'], download_url, now(), now(), item_id, download_url))
         db.execute('INSERT INTO provenance VALUES(?,?,?,?,?)',
                    (uid(), item_id, 'browser authorized download',
-                    dumps({'sourceUrl': source_url, 'format': fmt, 'fileName': path.name}), now()))
+                    dumps({'sourceUrl': source_url, 'downloadUrl': download_url, 'format': fmt, 'fileName': path.name}), now()))
     return {'itemId': item_id, 'attachmentId': added['id'], 'duplicate': bool(added.get('duplicate')),
             'format': fmt, 'indexJobId': job['jobId'] if job else None,
             'message': ('PDF 已导入，正在解析并建立全文索引' if fmt == 'pdf' and job else
