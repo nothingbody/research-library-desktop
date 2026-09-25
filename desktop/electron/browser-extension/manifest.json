@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "文献工作台 · 浏览器采集",
-  "version": "0.9.32",
+  "version": "0.9.33",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxi0z48sguvDshH1PSpg1o/32Sf1ymp6jiGpTvUTpFT3mpYj/A7nheBSdfE38YX0bbXjh9mua5mfdvShjvLj0/mCtXG1m6EjFXvGf7JxN8g+AGpsQrP+X3EUXEE4W8oksJz43i+GLBx9KkZuJoJVsHar2srrOlVRIImMyHaj9CKc7GgK7MAO9ZPAOnnhBaJLE4o4PkrnPmNWjqsAnmVywtC0mu13S9p3hW5Ny0x1xq9vnFFJu0n/LMRv1QlS9876nYwB7qQmEs7/Y//Y8xmByEOquBsSC0hte5LcfHYw7E1T+2uauLjwHgTlTUwjXdhpVrGPkFx0R7yhbNw84iO0hxwIDAQAB",
   "description": "将当前论文题录与可获取的 PDF 保存到本机文献库",
   "permissions": [

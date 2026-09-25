@@ -3,28 +3,21 @@ from __future__ import annotations
 """Resolve public full-text links and attach verified PDFs to a local item."""
 
 from html.parser import HTMLParser
-import ipaddress
-from urllib import error, parse, request
+import json
+import re
+from urllib import parse
 
-from .common import AppError, now, require, uid
-
-
-def public_url(value):
-    url = str(value or '').strip()
-    parts = parse.urlsplit(url)
-    require(len(url) <= 8000 and parts.scheme in ('https', 'http') and parts.hostname and
-            not parts.username and not parts.password, '请输入公开的 http(s) 文献地址')
-    try:
-        require(ipaddress.ip_address(parts.hostname).is_global, '不允许访问本机或内网地址')
-    except ValueError:
-        require(parts.hostname.lower() not in ('localhost', 'localhost.localdomain'), '不允许访问本机地址')
-    return url
+from .common import AppError, doi, now, require, uid
+from .netsafe import open_url, public_url
 
 
 class PdfLinks(HTMLParser):
     def __init__(self):
         super().__init__()
         self.links = []
+        self.refresh = ''
+        self._anchor = None
+        self._anchor_text = []
 
     def handle_starttag(self, tag, attrs):
         data = {key.lower(): value for key, value in attrs if key and value}
@@ -33,6 +26,26 @@ class PdfLinks(HTMLParser):
         elif tag == 'link' and ('application/pdf' in data.get('type', '').lower() or
                                  'pdf' in data.get('rel', '').lower()):
             self.links.append(data.get('href', ''))
+        elif tag == 'meta' and data.get('http-equiv', '').lower() == 'refresh':
+            match = re.search(r'\burl\s*=\s*[\'"]?([^\'";]+)', data.get('content', ''), re.I)
+            if match:
+                self.refresh = match.group(1).strip()
+        elif tag == 'a' and data.get('href'):
+            self._anchor, self._anchor_text = data, []
+
+    def handle_data(self, data):
+        if self._anchor is not None:
+            self._anchor_text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag != 'a' or self._anchor is None:
+            return
+        data, label = self._anchor, ' '.join(self._anchor_text)
+        label += ' ' + ' '.join(data.get(key, '') for key in ('href', 'title', 'aria-label', 'download'))
+        label = label.lower()
+        if re.search(r'(?:\.pdf(?:[?#]|$)|/pdf(?:/|\?|$)|/download(?:/|\?|$)|pdf\s*下载|下载\s*pdf|全文下载|download\s+pdf)', label) and not re.search(r'supplement|supporting|appendix|补充材料|参考文献', label):
+            self.links.append(data['href'])
+        self._anchor, self._anchor_text = None, []
 
 
 class Fulltext:
@@ -58,12 +71,56 @@ class Fulltext:
                 VALUES(?,?,?,'manual',?,?) ON CONFLICT(item_id,url) DO NOTHING''', (uid(), item_id, url, now(), now()))
         return next(row for row in self.sources(item_id) if row['url'] == url)
 
+    def discover(self, item_id):
+        """Record OA copies found by DOI/PMID without assuming they are PDFs."""
+        require(self.library.get_settings().get('online', True), '联网已关闭')
+        item = self.library.get(item_id)
+        identifier = doi(item.get('DOI')) if item.get('DOI') else ''
+        pmid = re.sub(r'\D', '', str(item.get('PMID') or ''))
+        require(identifier or pmid, '该文献没有 DOI 或 PMID；请手动添加 PDF 来源')
+        key = 'https://doi.org/' + identifier if identifier else 'pmid:' + pmid
+        found, errors = [], []
+
+        def fetch(url):
+            with open_url(url, accept='application/json', timeout=15) as response:
+                return json.loads(response.read(4 * 1024 * 1024).decode('utf-8'))
+
+        try:
+            work = fetch('https://api.openalex.org/works/' + parse.quote(key, safe=':/'))
+            locations = [work.get('best_oa_location') or {}] + list(work.get('locations') or [])
+            for location in locations:
+                if location.get('is_oa') or location == work.get('best_oa_location'):
+                    found.append(location.get('pdf_url') or location.get('landing_page_url'))
+            found.append((work.get('open_access') or {}).get('oa_url'))
+        except (AppError, ValueError) as exc:
+            errors.append('OpenAlex：' + str(exc))
+        contact = str(self.library.get_settings().get('contactEmail') or '').strip()
+        if identifier and re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', contact):
+            try:
+                url = 'https://api.unpaywall.org/v2/' + parse.quote(identifier, safe='/') + '?' + parse.urlencode({'email': contact})
+                work = fetch(url)
+                for location in [work.get('best_oa_location') or {}] + list(work.get('oa_locations') or []):
+                    found.append(location.get('url_for_pdf') or location.get('url_for_landing_page'))
+            except (AppError, ValueError) as exc:
+                errors.append('Unpaywall：' + str(exc))
+        added = 0
+        with self.library.db(True) as db:
+            for candidate in dict.fromkeys(link for link in found if link):
+                try:
+                    url = public_url(candidate)
+                except AppError:
+                    continue
+                added += db.execute('''INSERT INTO fulltext_sources(id,item_id,url,origin,created_at,updated_at)
+                    VALUES(?,?,?,'oa',?,?) ON CONFLICT(item_id,url) DO NOTHING''',
+                    (uid(), item_id, url, now(), now())).rowcount
+        return {'added': added, 'errors': errors, 'sources': self.sources(item_id)}
+
     def submit(self, payload):
         item_id = payload.get('itemId')
         sources = self.sources(item_id)
-        source_id = payload.get('sourceId') or next((row['id'] for row in sources if row['origin'] in ('oa', 'manual')), None)
-        require(source_id and any(row['id'] == source_id for row in sources), '没有可用的全文来源；请添加公开 PDF 地址或手动导入')
-        return self.jobs.create('fulltext.obtain', {'itemId': item_id, 'sourceId': source_id})
+        source_id = payload.get('sourceId')
+        require(not source_id or any(row['id'] == source_id for row in sources), '全文来源不存在或不属于此文献')
+        return self.jobs.create('fulltext.obtain', {'itemId': item_id, **({'sourceId': source_id} if source_id else {})})
 
     def _source(self, payload):
         with self.library.db() as db:
@@ -72,32 +129,60 @@ class Fulltext:
         require(row, '全文来源不存在或不属于此文献')
         return dict(row)
 
-    def _resolve(self, source, progress):
+    def _resolve(self, source, progress, depth=0):
         url = public_url(source['url'])
         progress(.05, '正在检查公开全文链接')
-        try:
-            req = request.Request(url, headers={'User-Agent': 'ResearchLibrary/0.7', 'Accept': 'application/pdf,text/html'})
-            with request.urlopen(req, timeout=25) as response:
-                final_url = public_url(response.geturl())
-                raw = response.read(1024 * 1024)
-                content_type = response.headers.get('Content-Type', '').lower()
-        except (error.URLError, TimeoutError, OSError) as exc:
-            raise AppError('FULLTEXT_NETWORK', '全文链接无法访问，请检查网络或在浏览器中手动取得 PDF', retryable=True) from exc
+        with open_url(url, timeout=25) as response:
+            final_url = public_url(response.geturl())
+            raw = response.read(2 * 1024 * 1024)
+            content_type = response.headers.get('Content-Type', '').lower()
         if b'%PDF-' in raw[:1024]:
             return final_url, 'pdf'
         if 'html' not in content_type and not raw.lstrip().lower().startswith((b'<!doctype html', b'<html')):
             return '', 'unknown'
         parser = PdfLinks()
         parser.feed(raw.decode('utf-8', errors='replace'))
+        if not parser.links and parser.refresh and depth < 2:
+            return self._resolve({'url': public_url(parse.urljoin(final_url, parser.refresh))}, progress, depth + 1)
+        item_doi = ''
+        if source.get('item_id'):
+            item = self.library.get(source['item_id'])
+            item_doi = doi(item.get('DOI')) if item.get('DOI') else ''
         for link in parser.links[:8]:
             try:
-                return public_url(parse.urljoin(final_url, link)), 'pdf'
+                candidate = public_url(parse.urljoin(final_url, link))
+                decoded = parse.unquote(candidate).lower()
+                embedded = re.search(r'10\.\d{4,9}/[^?#]+', decoded)
+                if item_doi and embedded and item_doi.lower() not in decoded:
+                    continue
+                return candidate, 'pdf'
             except AppError:
                 continue
         return final_url, 'landing'
 
     def obtain(self, payload, progress):
         require(self.library.get_settings().get('online', True), '联网已关闭')
+        if not payload.get('sourceId'):
+            item_id = payload.get('itemId')
+            sources = self.sources(item_id)
+            if not any(row['origin'] == 'oa' for row in sources):
+                try:
+                    self.discover(item_id)
+                except AppError:
+                    pass
+                sources = self.sources(item_id)
+            sources = [row for row in sources if row['origin'] != 'record']
+            require(sources, '没有可用的全文来源；请添加 PDF 地址或用浏览器下载')
+            failures = []
+            for index, candidate in enumerate(sources):
+                try:
+                    return self.obtain({'itemId': item_id, 'sourceId': candidate['id']},
+                                       lambda amount, message: progress((index + amount) / len(sources), message))
+                except AppError as exc:
+                    failures.append(str(exc))
+                except Exception as exc:
+                    failures.append(f'{parse.urlsplit(candidate["url"]).hostname}：{type(exc).__name__}')
+            raise AppError('FULLTEXT_UNAVAILABLE', '所有全文来源均未取得 PDF：' + '；'.join(failures[:3]))
         source = self._source(payload)
         if source['attachment_id']:
             with self.library.db() as db:

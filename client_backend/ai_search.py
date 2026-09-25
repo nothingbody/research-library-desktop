@@ -146,6 +146,12 @@ class AiSearch:
                               ('机器学习', 'machine learning'), ('人工智能', 'artificial intelligence'),
                               ('智慧物流', 'smart logistics'), ('供应链', 'supply chain'), ('物流', 'logistics'),
                               ('柔性作业车间', 'flexible job shop'), ('作业车间', 'job shop'), ('调度', 'scheduling'),
+                              ('医院', 'hospital'), ('手术室', 'operating room'), ('手术', 'surgery'),
+                              ('排程', 'scheduling'), ('鲁棒', 'robust'), ('港口', 'port'),
+                              ('集装箱', 'container'), ('堆场', 'container yard'),
+                              ('强化学习', 'reinforcement learning'), ('深度学习', 'deep learning'),
+                              ('医疗', 'healthcare'), ('能源', 'energy'), ('交通', 'transportation'),
+                              ('制造', 'manufacturing'), ('机器人', 'robotics'),
                               ('多目标', 'multi objective'), ('优化', 'optimization'), ('综述', 'review'),
                               ('发展', 'development'), ('数字化', 'digital transformation')]
                 remaining, mapped = brief, []
@@ -153,7 +159,11 @@ class AiSearch:
                     if chinese in remaining:
                         mapped.append(translation)
                         remaining = remaining.replace(chinese, ' ')
-                english = ' '.join(dict.fromkeys(mapped))[:220]
+                specific = [term for term in dict.fromkeys(mapped) if term not in
+                            {'scheduling', 'optimization', 'review', 'development'}]
+                # A single broad translated word is worse than the user's
+                # original Chinese wording on multilingual indexes.
+                english = ' '.join(dict.fromkeys(mapped))[:220] if len(specific) >= 2 else ''
             first_clause = re.split(r'[。；;\n]', brief, maxsplit=1)[0]
             primary = _text(quoted[0] if quoted and re.search(r'[A-Za-z]{3}', quoted[0]) else english or first_clause, 220)
             query_pairs = [('核心问题', primary or 'research literature')]
@@ -1227,7 +1237,7 @@ class AiSearch:
         imported, existing, missing = [], [], []
         def remember_sources(db, item_id, row):
             links = [(row.get('oa_url'), 'oa'), (row.get('url'), 'record')]
-            links.extend((url, 'record') for url in row.get('fulltextLinks') or [])
+            links.extend((url, 'publisher') for url in row.get('fulltextLinks') or [])
             for url, origin in links:
                 url = _text(url, 2000)
                 parts = parse.urlsplit(url)
@@ -1236,7 +1246,7 @@ class AiSearch:
                 db.execute('''INSERT INTO fulltext_sources(id,item_id,candidate_id,url,origin,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?) ON CONFLICT(item_id,url) DO UPDATE SET
                     candidate_id=COALESCE(fulltext_sources.candidate_id,excluded.candidate_id),
-                    origin=CASE WHEN excluded.origin='oa' THEN 'oa' ELSE fulltext_sources.origin END''',
+                    origin=CASE WHEN excluded.origin='oa' THEN 'oa' WHEN excluded.origin='publisher' AND fulltext_sources.origin='record' THEN 'publisher' ELSE fulltext_sources.origin END''',
                     (uid(), item_id, row['id'], url, origin, now(), now()))
         with self.library.db(True) as db:
             if collection_id:

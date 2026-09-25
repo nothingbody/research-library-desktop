@@ -3,12 +3,47 @@ from __future__ import annotations
 
 import re
 import json
+import secrets
+import shutil
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .biblio import author_name, normalize, year_of
-from .common import doi, dumps, norm, now, require, uid, within
-from .fulltext import public_url
+from .common import AppError, doi, dumps, norm, now, require, uid
+from .downloads import validate_pdf
+from .netsafe import public_url
+
+
+_tickets = {}
+_ticket_lock = threading.Lock()
+_ticket_ttl = 2 * 60 * 60
+
+
+def _issue_ticket(item_id, page_url, pdf_url):
+    ticket = secrets.token_hex(16)
+    with _ticket_lock:
+        cutoff = time.time() - _ticket_ttl
+        for key, value in list(_tickets.items()):
+            if value['created'] < cutoff:
+                _tickets.pop(key, None)
+        _tickets[ticket] = {'itemId': item_id, 'pageUrl': page_url, 'pdfUrl': pdf_url, 'created': time.time()}
+    return ticket
+
+
+def _ticket_file(value, ticket, saved):
+    path = Path(str(value or '')).expanduser().resolve()
+    require(path.is_file() and path.suffix.lower() in ('.pdf', '.caj'), '浏览器下载文件不存在或格式不正确')
+    require(ticket[:12] in path.name and path.stat().st_mtime >= saved['created'] - 120,
+            '下载文件与本次保存不匹配，请重新下载')
+    return path
+
+
+def cnki_host(host):
+    host = str(host or '').lower()
+    return bool(re.search(r'(^|\.)cnki\.(net|com\.cn)$', host) or
+                re.search(r'(^|[.-])cnki[.-](net|com[.-]cn)([.-]|$)', host))
 
 
 def _arxiv_id(url):
@@ -96,10 +131,22 @@ def capture(library, fulltext, payload):
     data['URL'] = page_url
     collection_id = payload.get('collectionId') or None
     pdf_url = str(payload.get('pdfUrl') or '').strip()
+    browser_download = bool(payload.get('browserDownload') and payload.get('downloadPdf'))
+    browser_pdf_url = str(payload.get('browserDownloadUrl') or pdf_url).strip()
+    if browser_download and browser_pdf_url:
+        browser_parts = urlsplit(browser_pdf_url)
+        require(len(browser_pdf_url) <= 8000 and browser_parts.scheme in ('http', 'https') and browser_parts.hostname and
+                not browser_parts.username and not browser_parts.password, '浏览器 PDF 地址不正确')
+    pdf_warning = ''
     if pdf_url:
-        pdf_url = public_url(pdf_url)
+        try:
+            pdf_url = public_url(pdf_url)
+        except AppError as exc:
+            if not browser_download:
+                pdf_warning = f'PDF 地址未保存：{exc}'
+            pdf_url = ''
     online = bool(library.get_settings().get('online', True))
-    download = bool(pdf_url and payload.get('downloadPdf') and online and not payload.get('browserDownload'))
+    download = bool(pdf_url and payload.get('downloadPdf') and online and not browser_download)
     with library.db(True) as db:
         if collection_id:
             require(db.execute('SELECT 1 FROM collections WHERE id=?', (collection_id,)).fetchone(), '集合不存在')
@@ -125,10 +172,11 @@ def capture(library, fulltext, payload):
     source = fulltext.add({'itemId': item_id, 'url': pdf_url}) if pdf_url else None
     already_attached = bool(source and source.get('attachmentId'))
     job = fulltext.submit({'itemId': item_id, 'sourceId': source['id']}) if source and download and not already_attached else None
+    ticket = _issue_ticket(item_id, page_url, browser_pdf_url) if browser_download and browser_pdf_url and not already_attached else None
     return {'itemId': item_id, 'created': not bool(existing), 'collectionId': collection_id,
             'pdfSourceId': source['id'] if source else None, 'downloadJobId': job['jobId'] if job else None,
             'pdfAlreadyAttached': already_attached, 'downloadSkippedOffline': bool(pdf_url and payload.get('downloadPdf') and not online),
-            'duplicateBasis': duplicate_basis}
+            'duplicateBasis': duplicate_basis, 'pdfWarning': pdf_warning, 'downloadTicket': ticket}
 
 
 def _authorized_cnki_url(value):
@@ -137,8 +185,7 @@ def _authorized_cnki_url(value):
     host = (parts.hostname or '').lower()
     require(len(url) <= 8000 and parts.scheme == 'https' and host and not parts.username and not parts.password,
             '知网下载地址不正确')
-    require(host == 'cnki.net' or host.endswith('.cnki.net') or host == 'cnki.com.cn' or host.endswith('.cnki.com.cn'),
-            '只接受知网官方授权下载地址')
+    require(cnki_host(host), '只接受知网（含校园代理）的授权下载地址')
     return url
 
 
@@ -177,31 +224,67 @@ def import_downloaded(library, fulltext, payload):
     """Import a verified browser download without reading browser credentials."""
     require(isinstance(payload, dict), '浏览器下载信息不正确')
     item_id = str(payload.get('itemId') or '')
-    download_url = str(payload.get('downloadUrl') or '').strip()
-    publisher = bool(download_url)
-    source_url, download_url = (_authorized_publisher_url(payload.get('sourceUrl'), download_url)
-                                if publisher else (_authorized_cnki_url(payload.get('sourceUrl')), ''))
-    fmt = str(payload.get('format') or '').lower()
-    require(fmt == 'pdf' if publisher else fmt in ('pdf', 'caj'), '浏览器下载格式不正确')
-    path = _browser_download_path(payload.get('path'), fmt)
+    ticket = str(payload.get('ticket') or '')
+    if ticket:
+        with _ticket_lock:
+            saved = dict(_tickets.get(ticket) or {})
+        require(saved and saved['itemId'] == item_id and saved['created'] >= time.time() - _ticket_ttl,
+                '下载凭据已失效，请重新打开网页保存')
+        path = _ticket_file(payload.get('path'), ticket, saved)
+        source_url, download_url = saved['pageUrl'], saved['pdfUrl']
+        publisher = False
+    else:
+        download_url = str(payload.get('downloadUrl') or '').strip()
+        publisher = bool(download_url)
+        source_url, download_url = (_authorized_publisher_url(payload.get('sourceUrl'), download_url)
+                                    if publisher else (_authorized_cnki_url(payload.get('sourceUrl')), ''))
+        fmt = str(payload.get('format') or '').lower()
+        require(fmt == 'pdf' if publisher else fmt in ('pdf', 'caj'), '浏览器下载格式不正确')
+        path = _browser_download_path(payload.get('path'), fmt)
     if publisher:
         with library.db() as db:
             require(db.execute('SELECT 1 FROM fulltext_sources WHERE item_id=? AND url=?',
                                (item_id, download_url)).fetchone(), '该文献没有对应的 PDF 来源')
+    with path.open('rb') as stream:
+        header = stream.read(1024).lstrip().lower()
+    require(not header.startswith((b'<!doctype html', b'<html', b'<?xml')),
+            '浏览器下载的是登录页或网页，并非全文文件')
+    fmt = 'pdf' if b'%pdf-' in header[:1024] else 'caj'
     if fmt == 'pdf':
-        with path.open('rb') as stream:
-            require(b'%PDF-' in stream.read(1024), '浏览器下载的文件不是 PDF；可能是登录页或站点拦截页')
-    added = fulltext.downloads.attachments.add(item_id, path, mode='managed', role='main')
+        validate_pdf(path)
+    else:
+        require(path.suffix.lower() == '.caj' and cnki_host(urlsplit(source_url).hostname),
+                '下载文件不是 PDF，无法作为全文导入')
+    temporary = None
+    stored = path
+    if fmt == 'pdf' and path.suffix.lower() != '.pdf':
+        temporary = library.root / 'downloads' / (uid() + '.pdf')
+        temporary.parent.mkdir(exist_ok=True)
+        shutil.copyfile(path, temporary)
+        stored = temporary
+    try:
+        added = fulltext.downloads.attachments.add(item_id, stored, mode='managed', role='main')
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
     job = None
     if fmt == 'pdf' and not added.get('duplicate'):
         job = fulltext.jobs.create('pdf.index', {'attachmentId': added['id']})
     with library.db(True) as db:
-        if publisher:
+        if not added.get('duplicate'):
+            display_name = re.sub(r'-[0-9a-f]{12}(?=\.[^.]+$)', '', path.name) if ticket else path.name
+            if fmt == 'pdf':
+                display_name = re.sub(r'\.[^.]+$', '.pdf', display_name)
+            db.execute('UPDATE attachments SET name=? WHERE id=?', (display_name[:240], added['id']))
+        if (publisher or ticket) and download_url:
             db.execute('''UPDATE fulltext_sources SET state='attached',attachment_id=?,resolved_url=?,kind='pdf',error='',checked_at=?,updated_at=?
                 WHERE item_id=? AND url=?''', (added['id'], download_url, now(), now(), item_id, download_url))
         db.execute('INSERT INTO provenance VALUES(?,?,?,?,?)',
                    (uid(), item_id, 'browser authorized download',
-                    dumps({'sourceUrl': source_url, 'downloadUrl': download_url, 'format': fmt, 'fileName': path.name}), now()))
+                   dumps({'sourceUrl': source_url, 'downloadUrl': download_url, 'format': fmt, 'fileName': path.name}), now()))
+    if ticket:
+        with _ticket_lock:
+            _tickets.pop(ticket, None)
     return {'itemId': item_id, 'attachmentId': added['id'], 'duplicate': bool(added.get('duplicate')),
             'format': fmt, 'indexJobId': job['jobId'] if job else None,
             'message': ('PDF 已导入，正在解析并建立全文索引' if fmt == 'pdf' and job else

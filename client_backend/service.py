@@ -102,7 +102,7 @@ class Application:
     def call(self, method, p):
         library, attachments = self.library, self.attachments
         routes = {
-            'app.info': lambda: {'version': '0.9.32', 'root': str(library.root), 'settings': library.get_settings()},
+            'app.info': lambda: {'version': '0.9.33', 'root': str(library.root), 'settings': library.get_settings()},
             'library.stats': library.stats,
             'library.reindex': lambda: self.jobs.create('library.index', {}),
             'items.list': lambda: library.query(p),
@@ -186,6 +186,7 @@ class Application:
             'attachments.download': lambda: self.jobs.create('pdf.download', p),
             'attachments.setRole': lambda: attachments.set_role(p['id'], p['role']),
             'fulltext.sources': lambda: self.fulltext.sources(p['itemId']),
+            'fulltext.discover': lambda: self.fulltext.discover(p['itemId']),
             'fulltext.add': lambda: self.fulltext.add(p),
             'fulltext.obtain': lambda: self.fulltext.submit(p),
             'documents.search': lambda: self.documents.search(p),
@@ -247,7 +248,7 @@ class Application:
                       'notes.save', 'notes.delete', 'annotations.excerpt', 'metadata.apply', 'settings.save', 'reading.save',
                       'reading.activity', 'terms.save', 'terms.delete', 'assistant.settings', 'assistant.run', 'assistant.translation.page', 'assistant.apply',
                       'aiSearch.create', 'aiSearch.savePlan', 'aiSearch.run', 'aiSearch.expand', 'aiSearch.citationExpand', 'aiSearch.rerank', 'aiSearch.intro', 'aiSearch.import', 'aiSearch.cancel', 'aiSearch.verify', 'aiSearch.decision', 'searchEvaluation.save',
-                      'fulltext.add', 'fulltext.obtain',
+                      'fulltext.add', 'fulltext.obtain', 'fulltext.discover',
                       'researchAsk.create', 'researchAsk.send', 'researchAsk.saveClaim',
                       'projects.create', 'projects.archive', 'projects.link', 'smartCollections.save',
                       'relations.profile.run', 'relations.create', 'relations.run', 'relations.confirm', 'relations.export', 'relations.discover', 'relations.discoveryDecide', 'relations.manualAdd', 'relations.manualRemove',

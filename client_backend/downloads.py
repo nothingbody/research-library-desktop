@@ -3,10 +3,29 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import urllib.parse
-import urllib.request
 
-from .common import require, uid
-from .fulltext import public_url
+from pypdf import PdfReader
+
+from .common import AppError, require, uid
+from .netsafe import open_url, public_url
+
+
+def validate_pdf(path):
+    """Reject login pages and incomplete PDF files before attaching them."""
+    path = Path(path)
+    with path.open('rb') as stream:
+        require(b'%PDF-' in stream.read(1024), '下载内容不是 PDF；可能是登录页或网站拦截页')
+        stream.seek(max(0, path.stat().st_size - 4096))
+        require(b'%%EOF' in stream.read(), 'PDF 下载未完成：缺少文件结束标记')
+    try:
+        reader = PdfReader(path, strict=False)
+        if reader.is_encrypted and not reader.decrypt(''):
+            return
+        require(len(reader.pages) > 0, 'PDF 文件没有可阅读页面')
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError('PDF_INVALID', 'PDF 文件结构不完整或已损坏') from exc
 
 
 class Downloads:
@@ -24,10 +43,12 @@ class Downloads:
         target = temporary / (uid() + '.pdf')
         limit = 512 * 1024 * 1024
         try:
-            request = urllib.request.Request(url, headers={'User-Agent': 'ResearchLibrary/0.1', 'Accept': 'application/pdf'})
-            with urllib.request.urlopen(request, timeout=30) as response, target.open('wb') as output:
+            with open_url(url, accept='application/pdf', timeout=30) as response, target.open('wb') as output:
                 public_url(response.geturl())
-                length = int(response.headers.get('Content-Length') or 0)
+                try:
+                    length = int(response.headers.get('Content-Length') or 0)
+                except ValueError:
+                    length = 0
                 require(length <= limit, '在线下载超过512MB，请通过浏览器保存后导入')
                 total = 0
                 while True:
@@ -43,13 +64,17 @@ class Downloads:
                 output.flush()
                 os.fsync(output.fileno())
             require(total > 0, '下载内容为空')
+            if length and total != length:
+                raise AppError('PDF_INCOMPLETE', f'PDF 下载未完成：只收到 {total}/{length} 字节', retryable=True)
+            validate_pdf(target)
             result = self.attachments.add(payload['itemId'], target)
             name = Path(urllib.parse.unquote(urllib.parse.urlsplit(url).path)).name
             if not name.lower().endswith('.pdf'):
                 name = '在线全文.pdf'
-            with self.library.db(True) as db:
-                db.execute('UPDATE attachments SET name=? WHERE id=?', (name[:240], result['id']))
-            self.jobs.create('pdf.index', {'attachmentId': result['id']})
-            return {'attachmentId': result['id'], 'bytes': total, 'source': url}
+            if not result.get('duplicate'):
+                with self.library.db(True) as db:
+                    db.execute('UPDATE attachments SET name=? WHERE id=?', (name[:240], result['id']))
+                self.jobs.create('pdf.index', {'attachmentId': result['id']})
+            return {'attachmentId': result['id'], 'bytes': total, 'source': url, 'duplicate': bool(result.get('duplicate'))}
         finally:
             target.unlink(missing_ok=True)

@@ -1,7 +1,7 @@
 const apiRoot = 'http://127.0.0.1:28886/api/browser';
 const launcherUrl = 'researchlibrary://browser-capture';
 const element = id => document.getElementById(id);
-let token = '', pageUrl = '', duplicateTimer = 0, duplicateSequence = 0, nativeDownloads = [], browserPdfUrl = '';
+let token = '', pageUrl = '', duplicateTimer = 0, duplicateSequence = 0, nativeDownloads = [];
 function message(value, kind = '') {const node = element('message'); node.textContent = value; node.className = kind;}
 async function request(path, method = 'GET', body) {
   const response = await fetch(apiRoot + path, {method, headers: {'Content-Type': 'application/json', 'X-Research-Browser': token}, body: body ? JSON.stringify(body) : undefined});
@@ -39,21 +39,31 @@ function extract() {
     if (/报纸/.test(text)) return 'article-newspaper';
     return /期刊/.test(text) ? 'article-journal' : 'document';
   };
+  const cnkiHost = host => /(^|\.)cnki\.(net|com\.cn)$/i.test(host || '') || /(^|[.-])cnki[.-](net|com[.-]cn)([.-]|$)/i.test(host || '');
+  const cnkiDbType = (url, text) => {
+    let code = '';
+    try {const value = new URL(url, location.href); code = (value.searchParams.get('dbname') || value.searchParams.get('dbcode') || '').toUpperCase();} catch {}
+    if (/^(CDFD|CMFD|CDMD)/.test(code) || /(?:博士|硕士)?学位论文/.test(text)) return 'thesis';
+    if (/^(CPFD|IPFD|CPVD)/.test(code) || /会议/.test(text)) return 'paper-conference';
+    if (/^CCND/.test(code) || /报纸/.test(text)) return 'article-newspaper';
+    return 'article-journal';
+  };
+  const cnkiDownloads = root => [...root.querySelectorAll('a')].flatMap(link => {
+    const label = cleanText(link.textContent);
+    let href;
+    try {href = new URL(link.getAttribute('href') || '', location.href);} catch {return [];}
+    if (!/^https?:$/.test(href.protocol) || !cnkiHost(href.hostname)) return [];
+    if (/PDF\s*下载|下载\s*PDF/i.test(label)) return [{format: 'pdf', url: href.href, label: '用浏览器下载 PDF（使用当前知网权限）'}];
+    if (/CAJ\s*下载|整本下载|分章下载|分页下载/i.test(label)) return [{format: 'caj', url: href.href, label: `用浏览器${label}（CAJ 原件；实际为 PDF 时自动解析）`}];
+    return [];
+  }).filter((value, index, rows) => rows.findIndex(other => other.url === value.url) === index);
   const cnkiRecord = () => {
-    if (!/(^|\.)cnki\.net$/i.test(location.hostname || '')) return null;
+    if (!cnkiHost(location.hostname)) return null;
     const classification = (type, venue) => [
       '来源：知网',
       `类型：${{'article-journal': '期刊论文', 'paper-conference': '会议论文', thesis: '学位论文', book: '图书', 'article-newspaper': '报纸'}[type] || '其他文献'}`,
       ...(venue ? [`期刊：${venue}`] : [])
     ];
-    const officialDownloads = () => [...document.querySelectorAll('a')].flatMap(link => {
-      const label = cleanText(link.textContent);
-      const href = String(link.href || '').trim();
-      if (!href || !/^https:\/\//i.test(href) || !/(^|\.)cnki\.(net|com\.cn)(?:\/|$)/i.test(href)) return [];
-      if (/PDF\s*下载/i.test(label)) return [{format: 'pdf', url: href, label: '使用知网授权下载 PDF（保存后自动解析）'}];
-      if (/CAJ\s*下载/i.test(label)) return [{format: 'caj', url: href, label: '使用知网授权下载 CAJ 原件'}];
-      return [];
-    }).filter((value, index, rows) => rows.findIndex(other => other.format === value.format && other.url === value.url) === index);
     const rows = [...document.querySelectorAll('tr')].filter(row => row.querySelector('td.name a, td.name a.fz14'));
     const chosen = rows.find(row => row.querySelector('input.cbItem:checked, input[type="checkbox"]:checked')) || (rows.length === 1 ? rows[0] : null);
     if (rows.length && !chosen) return {requiresSelection: true};
@@ -74,12 +84,12 @@ function extract() {
     if (!title) return null;
     const issue = cleanText(document.querySelector('.top-tip')?.textContent);
     const venue = cleanText(document.querySelector('.top-tip a')?.textContent).replace(/[。.\s]+$/,'') || '';
-    const type = 'article-journal';
+    const type = cnkiDbType(location.href, issue + ' ' + cleanText(document.querySelector('.wx-tit, .brief')?.textContent).slice(0, 400));
     return {pageUrl: location.href, type, title,
       authors: [...document.querySelectorAll('#authorpart a')].map(author => cleanText(author.textContent).replace(/[\d,]+$/,'')).filter(Boolean),
       year: (issue.match(/(?:19|20)\d{2}/) || [])[0] || '', DOI: '', venue,
       abstract: cleanText(document.querySelector('#ChDivSummary, .abstract-text')?.textContent), pdfUrl: '',
-      tags: classification(type, venue), nativeDownloads: officialDownloads()};
+      tags: classification(type, venue), nativeDownloads: cnkiDownloads(document)};
   };
   const cnki = cnkiRecord();
   if (cnki) return cnki;
@@ -139,35 +149,47 @@ function extract() {
   // Its journal article route has a stable article-specific /pdf endpoint.
   if (!pdfUrl && isHost('mdpi.com') && /^\/\d{4}-\d{4}\/\d+\/\d+\/\d+\/?$/.test(currentUrl.pathname))
     pdfUrl = new URL(currentUrl.pathname.replace(/\/$/, '') + '/pdf', currentUrl).href;
-  // ScienceDirect does not consistently expose citation_pdf_url. Its article
-  // page holds a short-lived, article-specific /pdfft link instead. Only use
-  // that link when the current article itself is visibly marked Open Access;
-  // links in the reference list must never be mistaken for the main article.
+  // ScienceDirect's article-specific PDF link may require institutional access.
+  // Offer it through the reader's browser session without guessing OA status.
   const scienceDirect = /(^|\.)sciencedirect\.com$/i.test(currentUrl.hostname);
   const pii = (currentUrl.pathname.match(/\/article\/pii\/([^/?#]+)/i) || [])[1] || '';
   let fulltextNote = pdfUrl ? '已识别当前论文的 PDF 入口；保存后会尝试下载，实际可用性以返回的 PDF 为准。' : '';
   if (scienceDirect && pii) {
-    // The OA badge lives in ScienceDirect's article header, outside its
-    // <article> body. Inspect <main> so translated and original pages work.
-    const pageText = cleanText((document.querySelector('main') || document.body)?.textContent).slice(0, 5000);
-    const openAccess = /\bopen\s+access\b|开放获取/i.test(pageText);
     const articlePdf = [...document.querySelectorAll('a[href]')].find(link => {
       const url = String(link.href || '');
       const label = cleanText(link.getAttribute('aria-label') || link.textContent);
       return url.includes(`/science/article/pii/${pii}/pdfft`) && /pdf/i.test(label + ' ' + url);
     });
-    if (openAccess && articlePdf?.href) {
+    if (articlePdf?.href) {
       pdfUrl = articlePdf.href;
-      fulltextNote = '已识别 ScienceDirect 开放获取 PDF；保存后将自动下载并建立全文索引。';
-    } else {
-      // A publisher PDF link without an OA marker might require entitlement.
-      // Do not silently send it to the local public-downloader.
-      pdfUrl = '';
-      fulltextNote = '未识别到可公开下载的 PDF。若有机构访问权限，请在期刊页面下载后，通过“添加附件”导入。';
+      fulltextNote = '检测到本文的 ScienceDirect PDF 链接；浏览器会使用你的当前访问权限下载。';
+    } else if (!pdfUrl) {
+      fulltextNote = '页面上没有找到本文的 PDF 链接，请确认已登录或使用机构访问。';
+    }
+  }
+  if (!pdfUrl) {
+    const words = /\bpdf\b|PDF\s*下载|下载\s*PDF|全文下载|下载全文|download\s+(?:the\s+)?(?:full\s*text|article)/i;
+    const button = [...document.querySelectorAll('a[href]')].find(link => {
+      if (!mainArticleLink(link) || link.closest('nav, header')) return false;
+      let url;
+      try {url = new URL(link.href, location.href);} catch {return false;}
+      if (!/^https?:$/.test(url.protocol)) return false;
+      const candidateHost = url.hostname.toLowerCase();
+      if (candidateHost !== host && !candidateHost.endsWith('.' + host) && !host.endsWith('.' + candidateHost)) return false;
+      let candidateHref;
+      try {candidateHref = decodeURIComponent(url.href);} catch {candidateHref = url.href;}
+      if (doi && /10\.\d{4,9}\//i.test(candidateHref) && !doiMatches(url)) return false;
+      const label = cleanText([link.textContent, link.getAttribute('title'), link.getAttribute('aria-label')].join(' '));
+      return words.test(label) && !/supplement|supporting|appendix|补充材料/i.test(label + ' ' + url.pathname);
+    });
+    if (button) {
+      pdfUrl = button.href;
+      fulltextNote = '检测到 PDF 下载按钮；浏览器会使用当前网站会话尝试下载。';
     }
   }
   const arxiv = /^(?:www\.)?arxiv\.org$/i.test(new URL(location.href).hostname);
-  const directPdf = /\.pdf(?:$|[?#])/i.test(location.pathname) || (arxiv && /^\/pdf\//i.test(location.pathname));
+  const directPdf = document.contentType === 'application/pdf' || /\.pdf(?:$|[?#])/i.test(location.pathname) ||
+    /\/(?:pdfdirect|epdf|pdfft)(?:\/|$)/i.test(location.pathname) || (arxiv && /^\/pdf\//i.test(location.pathname));
   const detectedPdfUrl = directPdf ? location.href : pdfUrl;
   const authors = values('citation_author').length ? values('citation_author') : values('dc.creator');
   const year = (rawDate.match(/(?:19|20)\d{2}/) || [])[0] || '';
@@ -176,15 +198,7 @@ function extract() {
     'pmc.ncbi.nlm.nih.gov', 'academic.oup.com', 'cambridge.org', 'sciencedirect.com'].some(isHost);
   const type = first('citation_conference_title') ? 'paper-conference' : first('citation_dissertation_institution') ? 'thesis' : first('citation_book_title') ? 'book' :
     first('citation_journal_title') || recognizedJournal ? 'article-journal' : directPdf || (arxiv && !!first('citation_arxiv_id')) ? 'document' : 'webpage';
-  const browserPublisher = ['link.springer.com', 'onlinelibrary.wiley.com', 'tandfonline.com',
-    'journals.sagepub.com', 'pubs.acs.org', 'dl.acm.org', 'mdpi.com', 'academic.oup.com',
-    'ieeexplore.ieee.org', 'sciencedirect.com'].some(isHost);
-  let browserDownload = false;
-  if (detectedPdfUrl && browserPublisher) {
-    try {const pdfHost = new URL(detectedPdfUrl).hostname.toLowerCase();
-      browserDownload = pdfHost === host || pdfHost.endsWith('.' + host) || host.endsWith('.' + pdfHost);
-    } catch {}
-  }
+  const browserDownload = !!detectedPdfUrl;
   return {pageUrl: location.href, type, title: first('citation_title','dc.title','og:title') || document.title.replace(/\s+[|–-]\s+[^|–-]+$/, '').trim(),
     authors, year, DOI: doi,
     venue: first('citation_journal_title','citation_conference_title','prism.publicationname'),
@@ -199,7 +213,8 @@ async function enrichCnkiDetail(detailUrl) {
   const cleanText = value => String(value || '').replace(/\s+/g, ' ').trim();
   const url = new URL(String(detailUrl || ''), location.href);
   const host = url.hostname.toLowerCase();
-  if (url.protocol !== 'https:' || !(host === 'cnki.net' || host.endsWith('.cnki.net') || host === 'cnki.com.cn' || host.endsWith('.cnki.com.cn'))) throw Error('详情页地址不是知网官方地址');
+  const cnkiHost = value => /(^|\.)cnki\.(net|com\.cn)$/i.test(value || '') || /(^|[.-])cnki[.-](net|com[.-]cn)([.-]|$)/i.test(value || '');
+  if (!/^https?:$/.test(url.protocol) || !cnkiHost(host)) throw Error('详情页地址不是知网地址');
   const response = await fetch(url.href, {credentials: 'include', redirect: 'follow'});
   if (!response.ok) throw Error(`知网详情页无法访问（${response.status}）`);
   const document = new DOMParser().parseFromString(await response.text(), 'text/html');
@@ -207,13 +222,22 @@ async function enrichCnkiDetail(detailUrl) {
   if (!title) throw Error('知网未返回可识别的文章详情；可能需要先完成页面安全验证');
   const issue = cleanText(document.querySelector('.top-tip')?.textContent);
   const venue = cleanText(document.querySelector('.top-tip a')?.textContent).replace(/[。.\s]+$/,'');
+  const downloads = [...document.querySelectorAll('a')].flatMap(link => {
+    const label = cleanText(link.textContent);
+    let href;
+    try {href = new URL(link.getAttribute('href') || '', url.href);} catch {return [];}
+    if (!/^https?:$/.test(href.protocol) || !cnkiHost(href.hostname)) return [];
+    if (/PDF\s*下载|下载\s*PDF/i.test(label)) return [{format: 'pdf', url: href.href, label: '用浏览器下载 PDF（使用当前知网权限）'}];
+    if (/CAJ\s*下载|整本下载|分章下载|分页下载/i.test(label)) return [{format: 'caj', url: href.href, label: `用浏览器${label}（CAJ 原件；实际为 PDF 时自动解析）`}];
+    return [];
+  }).filter((value, index, rows) => rows.findIndex(other => other.url === value.url) === index);
   const keywords = [...document.querySelectorAll('#catalog_KEYWORD a, #catalog_KEYWORD span, .keywords a, .keywords span, [id*="KEYWORD"] a')]
     .map(node => cleanText(node.textContent)).filter(value => value && value !== '关键词').slice(0, 8);
   return {title, authors: [...document.querySelectorAll('#authorpart a')]
     .map(author => cleanText(author.textContent).replace(/[\d,]+$/,'')).filter(Boolean),
     year: (issue.match(/(?:19|20)\d{2}/) || [])[0] || '', venue,
     abstract: cleanText(document.querySelector('#ChDivSummary, .abstract-text, .abstract')?.textContent),
-    keywords: [...new Set(keywords)]};
+    keywords: [...new Set(keywords)], downloads};
 }
 async function currentPage() {
   const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
@@ -221,9 +245,12 @@ async function currentPage() {
   pageUrl = tab.url;
   let result;
   try {[{result}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, func: extract});}
-  catch {const url = new URL(tab.url), path = url.pathname, isPdf = /\.pdf(?:$|[?#])/i.test(path) || (/^(?:www\.)?arxiv\.org$/i.test(url.hostname) && /^\/pdf\//i.test(path));
+  catch {const url = new URL(tab.url), path = url.pathname;
+    let contentPdf = false;
+    try {const response = await fetch(tab.url, {method: 'HEAD', credentials: 'include'}); contentPdf = /application\/pdf/i.test(response.headers.get('Content-Type') || '');} catch {}
+    const isPdf = contentPdf || /\.pdf(?:$|[?#])/i.test(path) || /\/(?:pdfdirect|epdf|pdfft)(?:\/|$)/i.test(path) || (/^(?:www\.)?arxiv\.org$/i.test(url.hostname) && /^\/pdf\//i.test(path));
     return {pageUrl: tab.url, type: isPdf ? 'document' : 'webpage', title: decodeURIComponent(path.split('/').pop() || tab.title || '网页文献').replace(/\.pdf$/i,''),
-      authors: [], year: '', DOI: '', venue: '', abstract: '', pdfUrl: isPdf ? tab.url : ''};}
+      authors: [], year: '', DOI: '', venue: '', abstract: '', pdfUrl: isPdf ? tab.url : '', browserDownload: isPdf};}
   if (!result || typeof result !== 'object') throw Error('未能从当前页面读取题录，请打开文章详情页后重试。');
   if (result.requiresSelection) throw Error('知网结果页包含多篇文献，请先勾选一篇后再保存；也可打开该文献详情页。');
   pageUrl = result.pageUrl || tab.url;
@@ -234,6 +261,7 @@ async function currentPage() {
         result = {...result, title: details.title || result.title, authors: details.authors?.length ? details.authors : result.authors,
           year: details.year || result.year, venue: details.venue || result.venue, abstract: details.abstract || result.abstract,
           tags: [...new Set([...(result.tags || []), ...(details.keywords || []).map(keyword => `关键词：${keyword}`)])],
+          nativeDownloads: details.downloads?.length ? details.downloads : result.nativeDownloads,
           detailEnriched: true};
       }
     } catch (error) {result.detailEnrichmentError = error.message || '未能自动补全知网详情页数据';}
@@ -242,7 +270,6 @@ async function currentPage() {
 }
 function fill(data) {
   nativeDownloads = Array.isArray(data.nativeDownloads) ? data.nativeDownloads : [];
-  browserPdfUrl = data.browserDownload ? data.pdfUrl : '';
   const classification = element('classification');
   classification.textContent = (data.tags || []).join(' · ');
   classification.hidden = !classification.textContent;
@@ -262,8 +289,7 @@ function fill(data) {
   const fulltextNote = element('fulltext-note');
   fulltextNote.textContent = data.fulltextNote || (data.pdfUrl ? '保存后会尝试下载并验证 PDF，再建立全文索引；需要登录的链接可能无法自动下载。' : '未检测到当前论文的 PDF 入口；可留空，稍后在附件页添加。');
   fulltextNote.className = 'fulltext-note';
-  element('download').checked = !!data.pdfUrl;
-  element('download').disabled = !data.pdfUrl;
+  syncFulltextMode(!!data.pdfUrl);
   element('source').textContent = '来源：' + pageUrl;
   scheduleDuplicateCheck();
 }
@@ -287,12 +313,13 @@ function scheduleDuplicateCheck() {
   }, 350);
 }
 for (const name of ['title', 'authors', 'year', 'doi']) element(name).addEventListener('input', scheduleDuplicateCheck);
-element('pdf').addEventListener('input', () => {
-  const hasPdf = !!element('pdf').value.trim();
-  if (hasPdf && element('download').disabled) element('download').checked = true;
-  element('download').disabled = !hasPdf;
-  if (!hasPdf) element('download').checked = false;
-});
+function syncFulltextMode(hasPdf) {
+  const mode = element('fulltext-mode');
+  for (const option of mode.options) if (option.value !== 'none') option.disabled = !hasPdf;
+  if (!hasPdf) mode.value = 'none';
+  else if (mode.value === 'none') mode.value = 'browser';
+}
+element('pdf').addEventListener('input', () => syncFulltextMode(!!element('pdf').value.trim()));
 async function collections() {
   const {collections} = await request('/collections');
   const select = element('collection'), selected = select.value;
@@ -300,19 +327,11 @@ async function collections() {
   for (const item of collections) select.add(new Option(item.name, item.id));
   select.value = selected;
 }
-function downloadNative(choice, itemId) {
-  return new Promise((resolve, reject) => chrome.runtime.sendMessage({type: 'download-cnki', token, itemId, sourceUrl: pageUrl, url: choice.url, format: choice.format, title: element('title').value.trim()}, response => {
+function downloadInBrowser(choice, itemId, ticket) {
+  return new Promise((resolve, reject) => chrome.runtime.sendMessage({type: 'download-browser', token, ticket, itemId, pageUrl, url: choice.url, format: choice.format, title: element('title').value.trim()}, response => {
     const error = chrome.runtime.lastError;
     if (error) return reject(Error(error.message));
-    if (!response?.ok) return reject(Error(response?.error || '无法启动浏览器授权下载'));
-    resolve(response);
-  }));
-}
-function downloadPublisher(pdfUrl, itemId) {
-  return new Promise((resolve, reject) => chrome.runtime.sendMessage({type: 'download-publisher', token, itemId, sourceUrl: pageUrl, url: pdfUrl, title: element('title').value.trim()}, response => {
-    const error = chrome.runtime.lastError;
-    if (error) return reject(Error(error.message));
-    if (!response?.ok) return reject(Error(response?.error || '无法启动浏览器 PDF 下载'));
+    if (!response?.ok) return reject(Error(response?.error || '无法启动浏览器下载'));
     resolve(response);
   }));
 }
@@ -321,7 +340,17 @@ async function showRecord() {
   await collections();
   try {const data = await currentPage(); fill(data); return data;} catch (error) {element('save').disabled = true; message(error.message,'error'); return null;}
 }
+async function showLastDownload() {
+  const {downloadStatus} = await chrome.storage.local.get('downloadStatus');
+  await chrome.action.setBadgeText({text: ''}).catch(() => {});
+  if (!downloadStatus || Date.now() - downloadStatus.at > 30 * 60 * 1000) return;
+  const node = element('last-download');
+  node.textContent = '上次下载：' + downloadStatus.message;
+  node.className = 'fulltext-note' + (downloadStatus.kind === 'success' ? ' success' : '');
+  node.hidden = false;
+}
 async function initialize() {
+  showLastDownload().catch(() => {});
   token = (await chrome.storage.local.get('token')).token || '';
   if (token) {
     try {const data = await showRecord(); if (data?.detailEnriched) message('已自动补全知网详情页的摘要与关键词', 'success'); else if (data?.detailEnrichmentError) message(data.detailEnrichmentError, 'error'); return;} catch (error) {
@@ -354,25 +383,27 @@ element('save').addEventListener('click', async () => {
     const year = element('year').value.trim(); if (year && !/^\d{4}$/.test(year)) throw Error('年份应为四位数字');
     const authors = element('authors').value.split(/[;；]/).map(value => value.trim()).filter(Boolean);
     const pdfUrl = element('pdf').value.trim(); if (pdfUrl && !/^https?:\/\//i.test(pdfUrl)) throw Error('PDF 地址应以 http(s) 开头');
-    const useBrowser = element('download').checked && pdfUrl === browserPdfUrl;
+    const selected = element('native-download').value;
+    const nativeChoice = selected ? nativeDownloads[Number(selected.split(':')[1])] : null;
+    const mode = element('fulltext-mode').value;
+    const useBrowser = !!nativeChoice || (!!pdfUrl && mode === 'browser');
+    const browserChoice = nativeChoice || (useBrowser ? {url: pdfUrl, format: 'pdf'} : null);
     const result = await request('/capture','POST',{pageUrl, collectionId: element('collection').value || null, pdfUrl,
-      downloadPdf: element('download').checked, browserDownload: useBrowser,
+      downloadPdf: useBrowser || mode === 'desktop', browserDownload: useBrowser,
+      browserDownloadUrl: browserChoice?.url || '',
       data: {type: element('type').value, title, author: authors, year, DOI: element('doi').value.trim(),
         'container-title': element('venue').value.trim(), abstract: element('abstract').value.trim(),
         tags: (element('classification').textContent || '').split(' · ').map(value => value.trim()).filter(Boolean)}});
-    const selected = element('native-download').value;
-    const nativeChoice = selected ? nativeDownloads[Number(selected.split(':')[1])] : null;
-    if (nativeChoice) await downloadNative(nativeChoice, result.itemId);
     let browserError = '';
-    if (useBrowser && !result.pdfAlreadyAttached && !result.downloadSkippedOffline) {
-      try {await downloadPublisher(pdfUrl, result.itemId);} catch (error) {browserError = error.message || '浏览器拒绝下载';}
+    if (useBrowser && browserChoice && !result.pdfAlreadyAttached && !result.downloadSkippedOffline) {
+      try {await downloadInBrowser(browserChoice, result.itemId, result.downloadTicket);} catch (error) {browserError = error.message || '浏览器拒绝下载';}
     }
     message((result.created ? '已保存新文献' : '文献已存在，已补充集合和来源') +
-      (nativeChoice ? `；已交由浏览器使用当前知网授权下载 ${nativeChoice.format.toUpperCase()}，完成后会自动导入${nativeChoice.format === 'pdf' ? '并解析索引' : '为原件'}` :
-       browserError ? `；PDF 下载未启动：${browserError}。PDF 来源已记录，可在桌面端重试。` :
+      (browserError ? `；PDF 下载未启动：${browserError}` :
        result.pdfAlreadyAttached ? '；PDF 已在文献库中' : result.downloadSkippedOffline ? '；联网已关闭，已记录 PDF 来源但未下载' :
-       useBrowser ? '；已交由浏览器下载，完成后会自动验证、导入并建立索引' :
-       result.downloadJobId ? '；PDF 验证与下载任务已开始' : result.pdfSourceId ? '；已记录 PDF 来源' : ''), browserError ? 'error' : 'success');
+       useBrowser ? '；已交由浏览器下载，完成后会验证并导入全文' :
+       result.downloadJobId ? '；桌面端 PDF 下载任务已开始' : result.pdfSourceId ? '；已记录 PDF 来源' : '') +
+      (result.pdfWarning ? '；' + result.pdfWarning : ''), browserError || result.pdfWarning ? 'error' : 'success');
     scheduleDuplicateCheck();
   } catch (error) {message(error.message,'error');} finally {button.disabled = false;}
 });

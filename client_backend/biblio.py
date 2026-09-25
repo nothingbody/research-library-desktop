@@ -18,7 +18,7 @@ TYPE_TO_CSL = {'article': 'article-journal', 'inproceedings': 'paper-conference'
                'techreport': 'report', 'misc': 'document', 'online': 'webpage', 'unpublished': 'manuscript'}
 SOURCE_TO_CSL = {'journal-article': 'article-journal', 'proceedings-article': 'paper-conference',
                  'book-chapter': 'chapter', 'posted-content': 'manuscript', 'preprint': 'manuscript',
-                 'article': 'article-journal', 'review': 'article-journal', 'dissertation': 'thesis',
+                 'review': 'article-journal', 'dissertation': 'thesis',
                  'reference-entry': 'entry', 'journal-issue': 'periodical', 'journal-volume': 'periodical',
                  'journal': 'periodical', 'proceedings': 'book', 'edited-book': 'book',
                  'book-set': 'book', 'book-series': 'collection', 'other': 'document',
@@ -49,7 +49,38 @@ LATEX = LatexNodes2Text()
 
 
 def latex_text(value):
-    return LATEX.latex_to_text(str(value or '')).strip()
+    # Some database exports contain bare percent signs in prose. pylatexenc
+    # otherwise treats the remainder of the field as a TeX comment.
+    value = re.sub(r'(?<!\\)%', r'\\%', str(value or ''))
+    return LATEX.latex_to_text(value).strip()
+
+
+def bib_text(value, protect_caps=False):
+    """Encode edited display text back to a BibTeX-safe field value."""
+    value = str(value or '')
+    escaped = {'\\': r'\textbackslash{}', '{': r'\{', '}': r'\}',
+               '~': r'\textasciitilde{}', '^': r'\textasciicircum{}'}
+    value = ''.join(escaped.get(char, '\\' + char if char in '&%#_$' else char) for char in value)
+    if protect_caps:
+        value = re.sub(r'(?<![\w\\])([A-Z][A-Z0-9+-]{1,})(?!\w)', r'{\1}', value)
+    return value
+
+
+def safe_bib_raw(value):
+    # Preserve LaTeX markup, math and capitalization braces, while repairing
+    # malformed literal characters in source database exports.
+    return re.sub(r'(?<!\\)[&%]', lambda match: '\\' + match.group(), str(value))
+
+
+def original_or_encoded(original, key, value, *, protect_caps=False, normalized=False):
+    raw = original.get(key)
+    if raw is not None:
+        old = latex_text(raw)
+        if normalized:
+            old = re.sub(r'\s*(?:--+|[–—])\s*', '-', old)
+        if old == str(value):
+            return safe_bib_raw(raw)
+    return bib_text(value, protect_caps=protect_caps)
 
 
 def csl_type(value):
@@ -64,7 +95,7 @@ def csl_record(item):
     result['type'] = csl_type(result.get('type'))
     if result.get('author'):
         result['author'] = [{key: name[key] for key in ('family', 'given', 'literal', 'suffix') if name.get(key)}
-                            for name in result['author'] if isinstance(name, dict)]
+                            for name in result['author'] if isinstance(name, dict) and name.get('literal') != '等']
     if result.get('page'):
         result['page'] = re.sub(r'\s*(?:--+|[–—])\s*', '-', str(result['page']))
     return result
@@ -80,7 +111,13 @@ def author_name(value):
     parts = value.split()
     if len(parts) <= 1:
         return {'literal': value}
-    return {'family': parts[-1], 'given': ' '.join(parts[:-1])}
+    if len(parts) >= 3 and (parts[0].isupper() or parts[-1].casefold() in
+                            {'society', 'association', 'consortium', 'collaboration', 'committee', 'institute'}):
+        return {'literal': value}
+    family_start = len(parts) - 1
+    while family_start > 1 and parts[family_start - 1].casefold() in {'van', 'von', 'de', 'del', 'der', 'den', 'di', 'da', 'la', 'le'}:
+        family_start -= 1
+    return {'family': ' '.join(parts[family_start:]), 'given': ' '.join(parts[:family_start])}
 
 
 def authors_text(authors):
@@ -141,10 +178,9 @@ def split_bib_authors(value):
                 continue
         index += 1
     parts.append(value[start:])
-    return [{'literal': '等'} if part.strip().casefold() == 'others' else
-            {'literal': latex_text(part.strip()[1:-1])} if part.strip().startswith('{') and part.strip().endswith('}') else
+    return [{'literal': latex_text(part.strip()[1:-1])} if part.strip().startswith('{') and part.strip().endswith('}') else
             author_name(latex_text(part))
-            for part in parts if part.strip()]
+            for part in parts if part.strip() and part.strip().casefold() != 'others']
 
 
 def parse_bib(text):
@@ -157,6 +193,7 @@ def parse_bib(text):
         item = {'type': TYPE_TO_CSL.get(record.get('ENTRYTYPE'), 'document'), 'title': latex_text(record.get('title', '')),
                 'citationKey': record.get('ID', ''), 'author': split_bib_authors(record.get('author', '')),
                 'originalBib': record}
+        item['etAl'] = bool(re.search(r'(?:^|\s+and\s+)others\s*$', record.get('author', ''), re.I))
         for key, dest in [('journal', 'container-title'), ('booktitle', 'container-title'), ('year', 'year'),
                           ('doi', 'DOI'), ('url', 'URL'), ('volume', 'volume'), ('number', 'issue'), ('pages', 'page'),
                           ('abstract', 'abstract'), ('publisher', 'publisher'), ('issn', 'ISSN'), ('isbn', 'ISBN')]:
@@ -252,7 +289,8 @@ def export_records(items, fmt):
     if fmt in ('bib', 'bibtex', 'biblatex'):
         records = []
         for item in items:
-            record = dict(item.get('originalBib') or {})
+            original = item.get('originalBib') or {}
+            record = dict(original)
             original_type = record.get('ENTRYTYPE')
             record['ENTRYTYPE'] = original_type if original_type and TYPE_TO_CSL.get(original_type, 'document') == csl_type(item.get('type')) else CSL_TO_BIB.get(csl_type(item.get('type')), 'misc')
             if fmt == 'biblatex' and csl_type(item.get('type')) == 'webpage':
@@ -263,13 +301,21 @@ def export_records(items, fmt):
             for src, dest in [('title', 'title'), ('DOI', 'doi'), ('URL', 'url'), ('volume', 'volume'), ('issue', 'number'),
                               ('page', 'pages'), ('abstract', 'abstract'), ('publisher', 'publisher'), ('ISSN', 'issn'), ('ISBN', 'isbn')]:
                 if item.get(src):
-                    record[dest] = str(item[src])
+                    if src in ('DOI', 'URL', 'volume', 'issue', 'ISSN', 'ISBN'):
+                        record[dest] = str(item[src])
+                    elif src == 'page':
+                        old_page = re.sub(r'\s*(?:--+|[–—])\s*', '-', latex_text(original.get(dest)))
+                        record[dest] = safe_bib_raw(original[dest]) if original.get(dest) and old_page == str(item[src]) else re.sub(r'\s*[-–—]+\s*', '--', str(item[src]))
+                    else:
+                        record[dest] = original_or_encoded(original, dest, item[src], protect_caps=src == 'title')
                 else:
                     record.pop(dest, None)
             for key in ('journal', 'booktitle'):
                 record.pop(key, None)
             if item.get('container-title'):
-                record['journal' if csl_type(item.get('type')) == 'article-journal' else 'booktitle'] = item['container-title']
+                target_key = 'journal' if csl_type(item.get('type')) == 'article-journal' else 'booktitle'
+                original_key = 'journaltitle' if original.get('journaltitle') else target_key
+                record[target_key] = original_or_encoded(original, original_key, item['container-title'])
             if year_of(item):
                 record['year'] = year_of(item)
             else:
@@ -280,9 +326,18 @@ def export_records(items, fmt):
                 parts = item.get('issued', {}).get('date-parts', [])
                 if parts and parts[0]:
                     record['date'] = '-'.join(str(p).zfill(4 if index == 0 else 2) for index, p in enumerate(parts[0]))
-            authors = ['others' if a.get('literal') == '等' else '{' + a['literal'] + '}' if a.get('literal') else ', '.join(filter(None, [a.get('family'), a.get('given')])) for a in item.get('author', [])]
+            legacy_others = any(a.get('literal') == '等' for a in item.get('author', []))
+            authors = ['{' + bib_text(a['literal']) + '}' if a.get('literal') else
+                       ', '.join(filter(None, [bib_text(a.get('family')), bib_text(a.get('given'))]))
+                       for a in item.get('author', []) if a.get('literal') != '等']
+            et_al = bool(item.get('etAl') or legacy_others)
+            if et_al:
+                authors.append('others')
             if authors:
-                record['author'] = ' and '.join(authors)
+                raw_authors = original.get('author', '')
+                raw_others = bool(re.search(r'(?:^|\s+and\s+)others\s*$', raw_authors, re.I))
+                current_authors = [a for a in item.get('author', []) if a.get('literal') != '等']
+                record['author'] = safe_bib_raw(raw_authors) if raw_authors and split_bib_authors(raw_authors) == current_authors and raw_others == et_al else ' and '.join(authors)
             else:
                 record.pop('author', None)
             if item.get('tags'):
@@ -301,7 +356,8 @@ def export_records(items, fmt):
             line('TY', {'article-journal': 'JOUR', 'book': 'BOOK', 'paper-conference': 'CONF', 'thesis': 'THES', 'chapter': 'CHAP', 'report': 'RPRT', 'webpage': 'ELEC'}.get(kind, 'GEN'))
             line('TI', item['title'])
             for author in item.get('author', []):
-                line('AU', author.get('literal') or ', '.join(filter(None, [author.get('family'), author.get('given')])))
+                if author.get('literal') != '等':
+                    line('AU', author.get('literal') or ', '.join(filter(None, [author.get('family'), author.get('given')])))
             for field, tag in [('container-title', 'T2' if kind == 'chapter' else 'JO'), ('DOI', 'DO'), ('URL', 'UR'), ('abstract', 'AB'), ('volume', 'VL'), ('issue', 'IS'), ('ISSN', 'SN')]:
                 line(tag, item.get(field))
             line('PY', year_of(item))
