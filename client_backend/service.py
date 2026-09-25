@@ -115,6 +115,7 @@ class Application:
             'items.bulk': lambda: library.bulk(p['ids'], p['action'], p.get('value')),
             'items.deletePermanently': lambda: library.delete_permanently(p.get('ids')),
             'items.duplicates': library.duplicates,
+            'items.latestMerge': library.latest_merge,
             'items.merge': lambda: library.merge(p['targetId'], p['sourceIds']),
             'items.undoMerge': lambda: library.undo_merge(p['eventId']),
             'collections.list': library.collections,

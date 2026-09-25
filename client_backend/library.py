@@ -988,6 +988,16 @@ class Library:
             db.execute('INSERT INTO merge_events VALUES(?,?,0,?)', (event_id, dumps(snapshot), now()))
         return {'id': event_id, 'item': self.get(target_id)}
 
+    def latest_merge(self):
+        with self.db() as db:
+            for row in db.execute('SELECT id,data FROM merge_events WHERE undone=0 ORDER BY created_at DESC LIMIT 20'):
+                snapshot = json.loads(row['data'])
+                source_ids = snapshot.get('sourceIds', [])
+                if source_ids and all(db.execute('SELECT deleted_at FROM items WHERE id=?', (item_id,)).fetchone()
+                                      for item_id in [snapshot.get('targetId'), *source_ids]):
+                    return {'id': row['id'], 'targetId': snapshot['targetId'], 'sourceIds': source_ids}
+        return None
+
     def undo_merge(self, event_id):
         with self.db(True) as db:
             event = db.execute('SELECT * FROM merge_events WHERE id=? AND undone=0', (event_id,)).fetchone()

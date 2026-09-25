@@ -57,7 +57,7 @@ export default function App() {
     if (event === 'menu.search') document.querySelector<HTMLInputElement>('[data-search]')?.focus();
   }), [refresh, importFiles]);
   useEffect(() => {Promise.all([api('library.stats'), api('collections.list')]).then(([s, c]) => {setStats(s); setCollections(c);}).catch(fail);}, [tick, fail]);
-  useEffect(() => {if (view === 'duplicates') api('items.duplicates').then(setDuplicates).catch(fail);}, [view, tick, fail]);
+  useEffect(() => {if (view === 'duplicates') Promise.all([api('items.duplicates'), api('items.latestMerge')]).then(([groups, latest]) => {setDuplicates(groups); setUndo(latest?.id || null);}).catch(fail);}, [view, tick, fail]);
   useEffect(() => {
     const id = ++requestId.current; setLoading(true); setError('');
     api('items.list', {q: query, view, collectionId: collection, sort, direction: sort === 'title' ? 'asc' : 'desc', offset: (page - 1) * 200, limit: 200, ...filters})
