@@ -4,10 +4,23 @@ const element = id => document.getElementById(id);
 let token = '', pageUrl = '', activeTabId = 0, duplicateTimer = 0, duplicateSequence = 0, nativeDownloads = [], batchRecords = [];
 function message(value, kind = '') {const node = element('message'); node.textContent = value; node.className = kind;}
 async function request(path, method = 'GET', body) {
-  const response = await fetch(apiRoot + path, {method, headers: {'Content-Type': 'application/json', 'X-Research-Browser': token}, body: body ? JSON.stringify(body) : undefined});
-  const value = await response.json().catch(() => ({}));
-  if (!response.ok) {const error = Error(value.error || `本机服务返回 ${response.status}`); error.status = response.status; throw error;}
-  return value;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), path === '/connect' ? 5000 : 15000);
+  try {
+    const response = await fetch(apiRoot + path, {method, signal: controller.signal,
+      headers: {'Content-Type': 'application/json', 'X-Research-Browser': token}, body: body ? JSON.stringify(body) : undefined});
+    const value = await response.json().catch(() => null);
+    if (!response.ok) {const error = Error(value?.error || `本机服务返回 ${response.status}`); error.status = response.status; throw error;}
+    const valid = value && typeof value === 'object' && !Array.isArray(value) &&
+      (path !== '/connect' || (typeof value.token === 'string' && value.token)) &&
+      (path !== '/collections' || method !== 'GET' || Array.isArray(value.collections)) &&
+      (path !== '/capture' || (typeof value.itemId === 'string' && value.itemId));
+    if (!valid) {const error = Error('本机服务返回内容不完整，请重试'); error.status = response.status; throw error;}
+    return value;
+  } catch (error) {
+    if (controller.signal.aborted) throw Error('连接本机文献库超时，请重试');
+    throw error;
+  } finally {clearTimeout(timer);}
 }
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 function localServiceUnavailable(error) { return !Number.isInteger(error?.status); }
@@ -495,8 +508,12 @@ async function showRecord() {
     const data = await currentPage();
     if (data?.candidates?.length) {showBatch(data.candidates); return data;}
     element('batch').hidden = true; element('record').hidden = false;
-    fill(data); return data;
-  } catch (error) {element('save').disabled = true; message(error.message,'error'); return null;}
+    fill(data); element('save').disabled = false; return data;
+  } catch (error) {
+    element('save').disabled = true; element('connection').hidden = false;
+    element('record').hidden = true; element('batch').hidden = true;
+    message(error.message,'error'); return null;
+  }
 }
 function showBatch(candidates) {
   batchRecords = candidates.slice(0, 50);
@@ -564,11 +581,14 @@ async function showLastDownload() {
   node.className = 'fulltext-note' + (downloadStatus.kind === 'success' ? ' success' : '');
   node.hidden = false;
 }
+async function retryBrowserImports() {
+  await chrome.runtime.sendMessage({type: 'retry-downloads', token}).catch(() => {});
+}
 async function initialize() {
   showLastDownload().catch(() => {});
   token = (await chrome.storage.local.get('token')).token || '';
   if (token) {
-    try {const data = await showRecord(); if (data?.detailEnriched) message('已自动补全知网详情页的摘要与关键词', 'success'); else if (data?.detailEnrichmentError) message(data.detailEnrichmentError, 'error'); return;} catch (error) {
+    try {const data = await showRecord(); if (data?.detailEnriched) message('已自动补全知网详情页的摘要与关键词', 'success'); else if (data?.detailEnrichmentError) message(data.detailEnrichmentError, 'error'); await retryBrowserImports(); return;} catch (error) {
       if (error.status === 401 || error.status === 403) {await chrome.storage.local.remove('token'); token = '';}
       else if (!localServiceUnavailable(error)) throw error;
     }
@@ -577,10 +597,14 @@ async function initialize() {
   token = result.token;
   await chrome.storage.local.set({token});
   const data = await showRecord();
-  message(data?.detailEnriched ? '已连接本机文献库，并自动补全知网详情页数据' : data?.detailEnrichmentError || '已自动连接本机文献库', data?.detailEnrichmentError ? 'error' : 'success');
+  if (data) message(data.detailEnriched ? '已连接本机文献库，并自动补全知网详情页数据' : data.detailEnrichmentError || '已自动连接本机文献库', data.detailEnrichmentError ? 'error' : 'success');
+  await retryBrowserImports();
 }
 chrome.runtime.onMessage.addListener(event => {
-  if (event?.type === 'download-status') message(event.message, event.kind === 'success' ? 'success' : 'error');
+  if (event?.type === 'download-status') {
+    message(event.message, event.kind === 'success' ? 'success' : 'error');
+    if (event.kind !== 'success') element('connection').hidden = false;
+  }
 });
 element('retry').addEventListener('click', async () => {
   try {await initialize();} catch (error) {element('connection').hidden = false; element('record').hidden = true; message(error.message, 'error');}

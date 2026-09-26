@@ -446,7 +446,12 @@ termMappings是term和translation对象数组。调度优化中的代理模型�
                 if row['state'] in ('pending', 'running'):
                     return {'state': 'pending', 'sourceHash': source_hash}
                 if not force:
-                    return {'state': 'failed', 'sourceHash': source_hash, 'error': '本页翻译未完成，请重新尝试'}
+                    try:
+                        detail = json.loads(row['job_error'] or '{}').get('message')
+                    except (TypeError, ValueError, AttributeError):
+                        detail = None
+                    return {'state': 'failed', 'sourceHash': source_hash,
+                            'error': detail or '本页翻译未完成，请重新尝试'}
             if payload.get('startIfMissing') is False:
                 return {'state': 'missing', 'sourceHash': source_hash}
             self.submit({'task': 'translate_layout', 'itemId': item_id, 'attachmentId': attachment_id,
@@ -547,11 +552,12 @@ termMappings是term和translation对象数组。调度优化中的代理模型�
             except ValueError as exc:
                 raise AppError('ASSISTANT_RESPONSE_INVALID', '版式翻译未返回有效 JSON') from exc
             require(isinstance(translations, dict) and translations, '版式翻译没有返回可用译文')
-            translations = {str(key): str(value).strip()[:4000] for key, value in translations.items() if str(value).strip()}
-            require(translations, '版式翻译没有返回可用译文')
             segments, source_hash = self._translation_source(json.loads(input_data['text'])['segments'],
                                                               input_data.get('translationContext'))
-            require(all(part['id'] in translations for part in segments), '版式翻译缺少部分段落，请重试当前页')
+            require(set(translations) == {part['id'] for part in segments}, '版式翻译段落与原文不一致，请重试当前页')
+            require(all(isinstance(value, str) and value.strip() for value in translations.values()),
+                    '版式翻译段落格式不正确，请重试当前页')
+            translations = {key: value.strip() for key, value in translations.items()}
         elif task == 'align_translation':
             try:
                 value = json.loads(content)

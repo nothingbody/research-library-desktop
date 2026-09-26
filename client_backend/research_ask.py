@@ -32,15 +32,29 @@ class ResearchAsk:
         with self.library.db() as db:
             row = db.execute('SELECT * FROM research_conversations WHERE id=?', (conversation_id,)).fetchone()
             require(row, '文献问答不存在')
-            messages = db.execute('SELECT * FROM research_messages WHERE conversation_id=? ORDER BY created_at,rowid',
+            messages = db.execute('''SELECT m.*,j.state AS job_state,j.error AS job_error FROM research_messages m
+                LEFT JOIN jobs j ON j.id=m.job_id WHERE m.conversation_id=? ORDER BY m.created_at,m.rowid''',
                                   (conversation_id,)).fetchall()
             items = db.execute('SELECT id,title FROM items WHERE id IN (' + ','.join('?' for _ in json.loads(row['item_ids_json'])) + ')',
                                json.loads(row['item_ids_json'])).fetchall()
         return {'id': row['id'], 'title': row['title'], 'itemIds': json.loads(row['item_ids_json']),
                 'collectionId': row['collection_id'], 'items': [dict(value) for value in items],
-                'messages': [{'id': value['id'], 'role': value['role'], 'content': value['content'], 'status': value['status'],
-                              'result': json.loads(value['result_json']), 'jobId': value['job_id'], 'createdAt': value['created_at']}
-                             for value in messages], 'createdAt': row['created_at'], 'updatedAt': row['updated_at']}
+                'messages': [self._message(value) for value in messages],
+                'createdAt': row['created_at'], 'updatedAt': row['updated_at']}
+
+    @staticmethod
+    def _message(value):
+        status, result = value['status'], json.loads(value['result_json'])
+        if value['role'] == 'assistant':
+            if value['job_state'] in ('cancelled', 'failed'):
+                status = 'failed'
+                error = json.loads(value['job_error']) if value['job_error'] else {}
+                result = {**result, 'error': error.get('message') or result.get('error') or
+                          ('任务已取消，可重新提问或在任务中心重试' if value['job_state'] == 'cancelled' else '问答失败，可重新提问')}
+            elif value['job_state'] in ('pending', 'running') and status in ('pending', 'failed'):
+                status = 'pending'
+        return {'id': value['id'], 'role': value['role'], 'content': value['content'], 'status': status,
+                'result': result, 'jobId': value['job_id'], 'createdAt': value['created_at']}
 
     def send(self, payload):
         conversation_id = payload.get('conversationId')
@@ -51,7 +65,10 @@ class ResearchAsk:
         self.get(conversation_id)
         timestamp, answer_id = now(), uid()
         with self.library.db(True) as db:
-            pending = db.execute("SELECT 1 FROM research_messages WHERE conversation_id=? AND role='assistant' AND status='pending' LIMIT 1", (conversation_id,)).fetchone()
+            pending = db.execute('''SELECT 1 FROM research_messages m LEFT JOIN jobs j ON j.id=m.job_id
+                WHERE m.conversation_id=? AND m.role='assistant' AND
+                (j.state IN ('pending','running') OR (m.status='pending' AND m.job_id IS NULL)) LIMIT 1''',
+                (conversation_id,)).fetchone()
             require(not pending, '已有问题正在处理，请等待完成后继续提问')
             db.execute('INSERT INTO research_messages(id,conversation_id,role,content,created_at,updated_at) VALUES(?,?,?,?,?,?)',
                        (uid(), conversation_id, 'user', question, timestamp, timestamp))

@@ -34,16 +34,21 @@ class Attachments:
             role = 'supplementary' if re.search(r'(supplement(?:ary|al)?|supporting|appendix|(?:^|[_ .-])si(?:[_ .-]|$))', path.stem, re.I) else ('main' if mime == 'application/pdf' else 'other')
         require(role in ('main', 'supplementary', 'other'), '附件类型不正确')
         target = path
-        if mode == 'managed':
-            target = within(self.library.storage / digest[:2] / digest, self.library.storage)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                temporary = target.with_name(target.name + '.' + uid() + '.tmp')
-                shutil.copyfile(path, temporary)
-                require(sha256(temporary) == digest, '复制校验失败，请重试')
-                os.replace(temporary, target)
         with self.library.db(True) as db:
             self.library._get(db, item_id)
+            # The writer also protects the last-reference check and unlink in
+            # permanent deletion. A concurrent add must copy after that unlink.
+            if mode == 'managed':
+                target = within(self.library.storage / digest[:2] / digest, self.library.storage)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.is_file() or sha256(target) != digest:
+                    temporary = target.with_name(target.name + '.' + uid() + '.tmp')
+                    try:
+                        shutil.copyfile(path, temporary)
+                        require(sha256(temporary) == digest, '复制校验失败，请重试')
+                        os.replace(temporary, target)
+                    finally:
+                        temporary.unlink(missing_ok=True)
             same = db.execute('''SELECT a.id FROM attachments a JOIN objects o ON a.object_id=o.id WHERE a.item_id=? AND o.sha256=?''', (item_id, digest)).fetchone()
             if same:
                 return {'id': same[0], 'duplicate': True}
@@ -84,12 +89,17 @@ class Attachments:
             added = self.add(old['item_id'], path, old['mode'], old['role'])
             return {**added, 'newVersion': True, 'message': '已作为新附件版本添加，旧批注保留在原版本'}
         if old['mode'] == 'managed':
-            destination = within(Path(old['path']), self.library.storage)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temp = destination.with_name(destination.name + '.' + uid() + '.tmp')
-            shutil.copyfile(path, temp)
-            require(sha256(temp) == digest, '附件校验失败')
-            os.replace(temp, destination)
+            with self.library.writer:
+                self.record(attachment_id)
+                destination = within(Path(old['path']), self.library.storage)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temp = destination.with_name(destination.name + '.' + uid() + '.tmp')
+                try:
+                    shutil.copyfile(path, temp)
+                    require(sha256(temp) == digest, '附件校验失败')
+                    os.replace(temp, destination)
+                finally:
+                    temp.unlink(missing_ok=True)
         else:
             with self.library.db(True) as db:
                 db.execute('UPDATE objects SET path=? WHERE id=?', (str(path), old['object_id']))
@@ -281,7 +291,10 @@ class Attachments:
             writer.add_annotation(page_number=annotation['pageIndex'], annotation=obj)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temp = destination.with_name(destination.name + '.' + uid() + '.tmp')
-        with temp.open('wb') as stream:
-            writer.write(stream)
-        os.replace(temp, destination)
+        try:
+            with temp.open('wb') as stream:
+                writer.write(stream)
+            os.replace(temp, destination)
+        finally:
+            temp.unlink(missing_ok=True)
         return {'path': str(destination), 'annotations': len(self.list_annotations(attachment_id))}

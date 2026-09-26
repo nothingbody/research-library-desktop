@@ -269,8 +269,10 @@ class AiSearch:
         with self.library.db(True) as db:
             pending = db.execute("SELECT state FROM ai_search_sessions WHERE id=?", (session_id,)).fetchone()
             if pending and pending[0] in ('verifying','queued','cancelling') and session_id not in self._verifying and session_id not in self._running:
-                kind = 'ai-search.verify' if pending[0] == 'verifying' else 'ai-search.run'
-                jobs = db.execute('SELECT id,payload,state FROM jobs WHERE kind=?', (kind,)).fetchall()
+                kinds = ('ai-search.verify',) if pending[0] == 'verifying' else (
+                    'ai-search.run', 'ai-search.expand', 'ai-search.citations')
+                jobs = db.execute('SELECT id,payload,state FROM jobs WHERE kind IN (' +
+                                  ','.join('?' for _ in kinds) + ')', kinds).fetchall()
                 if not any(json.loads(j['payload']).get('sessionId') == session_id and (j['state'] in ('pending','running') or j['id'] in active_jobs) for j in jobs):
                     last = db.execute('SELECT state FROM search_runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1', (session_id,)).fetchone()
                     state = (last[0] if last else 'planned') if pending[0] == 'verifying' else 'cancelled'
@@ -833,7 +835,9 @@ class AiSearch:
         try:
             with self.library.db(True) as db:
                 row = db.execute('SELECT * FROM ai_search_sessions WHERE id=?', (session_id,)).fetchone()
-                require(row and row['state'] != 'cancelling', '检索已取消')
+                require(row, '检索任务不存在')
+                if row['state'] == 'cancelling':
+                    raise AppError('CANCELLED', '扩展检索已取消')
                 current = db.execute('SELECT id FROM search_runs WHERE session_id=? ORDER BY rowid DESC LIMIT 1', (session_id,)).fetchone()
                 require(current and current['id'] == run_id, '检索结果已更新，请重新查看')
                 session = self._session_value(row)
@@ -1265,6 +1269,7 @@ class AiSearch:
                     snap = json.loads(detail[0])
                     row.update({k: snap.get(k) for k in ('title','year','venue','abstract','doi','url','type','pmid','volume','issue','page','fulltextLinks')})
                     row['oa_url'] = snap.get('oaUrl', row['oa_url'])
+                    row['citation_count'] = snap.get('citationCount', row['citation_count'])
                     row['authors_json'] = dumps(snap['authors'])
                     row['title_norm'] = norm(snap['title'])
                 existing_item = db.execute('SELECT id FROM items WHERE deleted_at IS NULL AND (doi<>\'\' AND doi=? OR (doi=\'\' AND title_norm=? AND year=?)) LIMIT 1',

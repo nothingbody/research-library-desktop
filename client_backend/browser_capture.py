@@ -21,14 +21,16 @@ _ticket_lock = threading.Lock()
 _ticket_ttl = 2 * 60 * 60
 
 
-def _issue_ticket(item_id, page_url, pdf_url):
+def _issue_ticket(item_id, page_url, pdf_url, library_root):
     ticket = secrets.token_hex(16)
     with _ticket_lock:
         cutoff = time.time() - _ticket_ttl
         for key, value in list(_tickets.items()):
             if value['created'] < cutoff:
                 _tickets.pop(key, None)
-        _tickets[ticket] = {'itemId': item_id, 'pageUrl': page_url, 'pdfUrl': pdf_url, 'created': time.time()}
+        _tickets[ticket] = {'itemId': item_id, 'pageUrl': page_url, 'pdfUrl': pdf_url,
+                            'libraryRoot': str(Path(library_root).resolve()),
+                            'created': time.time(), 'importLock': threading.Lock()}
     return ticket
 
 
@@ -172,7 +174,7 @@ def capture(library, fulltext, payload):
     source = fulltext.add({'itemId': item_id, 'url': pdf_url}) if pdf_url else None
     already_attached = bool(source and source.get('attachmentId'))
     job = fulltext.submit({'itemId': item_id, 'sourceId': source['id']}) if source and download and not already_attached else None
-    ticket = _issue_ticket(item_id, page_url, browser_pdf_url) if browser_download and browser_pdf_url and not already_attached else None
+    ticket = _issue_ticket(item_id, page_url, browser_pdf_url, library.root) if browser_download and browser_pdf_url and not already_attached else None
     return {'itemId': item_id, 'created': not bool(existing), 'collectionId': collection_id,
             'pdfSourceId': source['id'] if source else None, 'downloadJobId': job['jobId'] if job else None,
             'pdfAlreadyAttached': already_attached, 'downloadSkippedOffline': bool(pdf_url and payload.get('downloadPdf') and not online),
@@ -223,14 +225,43 @@ def _browser_download_path(value, suffix):
 def import_downloaded(library, fulltext, payload):
     """Import a verified browser download without reading browser credentials."""
     require(isinstance(payload, dict), '浏览器下载信息不正确')
+    ticket = str(payload.get('ticket') or '')
+    if not ticket:
+        return _import_downloaded(library, fulltext, payload)
+    with _ticket_lock:
+        saved = _tickets.get(ticket)
+    require(saved, '下载凭据已失效，请重新打开网页保存')
+    # Serialize one ticket through validation, attachment creation and result
+    # recording, without holding the global ticket registry lock during I/O.
+    with saved['importLock']:
+        with _ticket_lock:
+            require(_tickets.get(ticket) is saved and saved['created'] >= time.time() - _ticket_ttl and
+                    saved['itemId'] == str(payload.get('itemId') or '') and
+                    saved['libraryRoot'] == str(library.root.resolve()),
+                    '下载凭据已失效，请重新打开网页保存')
+        path = _ticket_file(payload.get('path'), ticket, saved)
+        completed = saved.get('completed')
+        if completed:
+            require(str(path) == completed['path'], '下载文件与已完成的导入不匹配，请重新下载')
+            result = completed['result']
+            with library.db() as db:
+                attached = db.execute('SELECT 1 FROM attachments WHERE id=? AND item_id=?',
+                                      (result['attachmentId'], saved['itemId'])).fetchone()
+            require(attached, '下载凭据已失效：原导入附件已不存在，请重新打开网页保存')
+            fulltext.downloads.attachments.path(result['attachmentId'], verify=True)
+            return {**result, 'duplicate': True, 'message': '全文已在文献库中，已恢复导入结果'}
+        result = _import_downloaded(library, fulltext, payload, saved, path)
+        with _ticket_lock:
+            if _tickets.get(ticket) is saved:
+                saved['completed'] = {'path': str(path), 'result': dict(result)}
+        return result
+
+
+def _import_downloaded(library, fulltext, payload, saved=None, verified_path=None):
     item_id = str(payload.get('itemId') or '')
     ticket = str(payload.get('ticket') or '')
     if ticket:
-        with _ticket_lock:
-            saved = dict(_tickets.get(ticket) or {})
-        require(saved and saved['itemId'] == item_id and saved['created'] >= time.time() - _ticket_ttl,
-                '下载凭据已失效，请重新打开网页保存')
-        path = _ticket_file(payload.get('path'), ticket, saved)
+        path = verified_path
         source_url, download_url = saved['pageUrl'], saved['pdfUrl']
         publisher = False
     else:
@@ -286,9 +317,6 @@ def import_downloaded(library, fulltext, payload):
         db.execute('INSERT INTO provenance VALUES(?,?,?,?,?)',
                    (uid(), item_id, 'browser authorized download',
                    dumps({'sourceUrl': source_url, 'downloadUrl': download_url, 'format': fmt, 'fileName': path.name}), now()))
-    if ticket:
-        with _ticket_lock:
-            _tickets.pop(ticket, None)
     return {'itemId': item_id, 'attachmentId': added['id'], 'duplicate': bool(added.get('duplicate')),
             'format': fmt, 'indexJobId': job['jobId'] if job else None,
             'message': ('PDF 已导入，正在解析并建立全文索引' if fmt == 'pdf' and job else

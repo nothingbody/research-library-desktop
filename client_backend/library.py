@@ -529,15 +529,16 @@ class Library:
             require(db.execute('PRAGMA foreign_key_check').fetchone() is None, '删除后数据库关联校验失败')
         warnings, removed = [], 0
         for path in set(owned_paths):
-            with self.db() as db:
-                still_used = db.execute('SELECT 1 FROM objects WHERE path=?', (str(path),)).fetchone()
-            if still_used:
-                continue
-            try:
-                path.unlink(missing_ok=True)
-                removed += 1
-            except OSError as exc:
-                warnings.append({'path': str(path), 'error': str(exc)[:200]})
+            with self.writer:
+                with self.db() as db:
+                    still_used = db.execute('SELECT 1 FROM objects WHERE path=?', (str(path),)).fetchone()
+                if still_used:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError as exc:
+                    warnings.append({'path': str(path), 'error': str(exc)[:200]})
         return {'deleted': len(ids), 'removedFiles': removed, 'fileWarnings': warnings}
 
     def query(self, params):
@@ -1002,6 +1003,9 @@ class Library:
                 original_ids = {record['id'] for record in snapshot[table]}
                 snapshot['postRevisions'][table] = {row['id']: row['revision'] for row in db.execute(f'SELECT id,revision FROM {table}')
                                                      if row['id'] in original_ids}
+            snapshot['readingPost'] = {table: [dict(row) for row in db.execute(
+                f'SELECT * FROM {table} WHERE item_id IN ({placeholders}) ORDER BY id', ids)]
+                for table in ('reading_cards', 'reading_sessions')}
             cluster_ids = {row['cluster_id'] for row in snapshot['writing_citation_items']}
             snapshot['wordPost'] = [dict(row) for row in db.execute('SELECT * FROM writing_citation_items') if row['cluster_id'] in cluster_ids]
             snapshot.update(targetId=target_id, sourceIds=source_ids, expectedRevisions={row['id']: row['revision'] + 1 for row in snapshot['items']})
@@ -1029,6 +1033,17 @@ class Library:
                 for row_id, revision in revisions.items():
                     current = db.execute(f'SELECT revision FROM {table} WHERE id=?', (row_id,)).fetchone()
                     require(current and current['revision'] == revision, '合并后阅读卡、进度或术语已编辑，不能自动撤销')
+            for table, expected in snapshot.get('readingPost', {}).items():
+                item_ids = tuple(snapshot['expectedRevisions'])
+                marks = ','.join('?' for _ in item_ids)
+                current = [dict(row) for row in db.execute(f'SELECT * FROM {table} WHERE item_id IN ({marks}) ORDER BY id', item_ids)]
+                require(current == expected, '合并后阅读卡或进度已新增或编辑，不能自动撤销')
+            if 'readingPost' not in snapshot:
+                item_ids = tuple(snapshot['expectedRevisions'])
+                marks = ','.join('?' for _ in item_ids)
+                for table in ('reading_cards', 'reading_sessions'):
+                    require(not db.execute(f'SELECT 1 FROM {table} WHERE item_id IN ({marks}) AND updated_at>?',
+                                           (*item_ids, event['created_at'])).fetchone(), '合并后阅读卡或进度已新增或编辑，不能自动撤销')
             if 'wordPost' in snapshot:
                 cluster_ids = {row['cluster_id'] for row in snapshot['writing_citation_items']}
                 current_word = [dict(row) for row in db.execute('SELECT * FROM writing_citation_items') if row['cluster_id'] in cluster_ids]

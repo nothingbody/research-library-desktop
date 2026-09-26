@@ -46,10 +46,12 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
   const readerBody = useRef<HTMLDivElement>(null), selectionActions = useRef<HTMLDivElement>(null);
   const wheelAmount = useRef(0), wheelDirection = useRef(0), wheelTime = useRef(0), pendingWheelPosition = useRef<'top' | 'bottom' | null>(null);
   const selectionStart = useRef<{x: number; y: number} | null>(null);
+  const annotationSaving = useRef(false);
   const captureRef = useRef<(event: {clientX: number; clientY: number}) => void>(() => {});
   const wheelScale = useRef(scale);
   useEffect(() => {wheelScale.current = scale;}, [scale]);
   const zoomAnchor = useRef<{element: HTMLElement; x: number; y: number; clientX: number; clientY: number; width: number; oldScale: number; scale: number} | null>(null);
+  useEffect(() => {setSelection(null); window.getSelection()?.removeAllRanges();}, [scale, rotation, mode, pdf]);
   useEffect(() => {
     const container = pdfScroll.current;
     if (!container) return;
@@ -259,19 +261,40 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
   async function addAnnotation(type: string, captured = selection, annotationText = '') {
     const evidenceViewport = captured?.viewport || viewport;
     if (!captured || !record || !evidenceViewport) {notify(type === 'area' ? '在页面上拖出一个矩形区域。' : '先在 PDF 中选取文字。'); return;}
+    if (annotationSaving.current) return;
+    annotationSaving.current = true;
+    const pages: Data[] = (captured.pages || [captured]).map((source: Data) => ({...source, annotationId: source.annotationId || crypto.randomUUID()}));
+    let saved = 0;
     try {
-      const sourcePage = captured.page || page;
-      const value = await api('annotations.save', {attachmentId, data: {type, version: record.version, pageIndex: sourcePage - 1, pageLabel: String(sourcePage), rects: captured.rects, quote: captured.quote || '', color, pageBox: evidenceViewport.viewBox, rotation, comment: annotationText}});
-      setAnnotations(old => [...old, value]); setActive(value); setComment(annotationText); setSelection(null); window.getSelection()?.removeAllRanges(); setArea(null); setAnnotationDraft(null);
+      const known: Data[] = pages.some(source => source.annotationRetry) ? await api('annotations.list', {attachmentId}) : [];
+      for (const source of pages) {
+        const sourcePage = source.page || page, sourceViewport = source.viewport || evidenceViewport;
+        const existing = known.find(value => value.id === source.annotationId);
+        const value = await api('annotations.save', {attachmentId, data: {id: source.annotationId, revision: existing?.revision, type, version: record.version, pageIndex: sourcePage - 1, pageLabel: String(sourcePage), rects: source.rects, quote: source.quote || '', color, pageBox: sourceViewport.viewBox, rotation, comment: annotationText}});
+        setAnnotations(old => old.some(entry => entry.id === value.id) ? old.map(entry => entry.id === value.id ? value : entry) : [...old, value]); setActive(value);
+        saved++;
+      }
+      setComment(annotationText); setSelection(null); window.getSelection()?.removeAllRanges(); setArea(null); setAnnotationDraft(null);
       notify(annotationText ? '批注已保存' : type === 'underline' ? '已添加下划线' : type === 'area' ? '区域批注已保存' : '已添加高亮');
-    } catch(e) {fail(e);}
+    } catch(e) {
+      const remaining: Data[] = pages.slice(saved).map(source => ({...source, annotationRetry: true}));
+      const pending = remaining.length === 1 ? remaining[0] : {...remaining[0], pages: remaining, quote: remaining.map(source => source.quote).join('\n\n')};
+      setSelection(pending); setAnnotationDraft(current => current ? pending : null);
+      window.getSelection()?.removeAllRanges();
+      if (saved) {
+        fail(new Error(`已保存 ${saved} 页批注；剩余 ${remaining.length} 页保存失败，可重试。${useErrorText(e)}`));
+      } else fail(e);
+    } finally {annotationSaving.current = false;}
   }
   function startSelectedNote(captured = selection) {
     if (!captured?.quote?.trim() || !record?.itemId) {notify('先在 PDF 中选取文字。'); return;}
-    const sourcePage = captured.page || page;
-    const quote = String(captured.quote).trim().replace(/\r?\n/g, '\n> ');
-    setNoteDraft({itemId: record.itemId, title: `阅读笔记 · 第 ${sourcePage} 页`,
-      content: `> ${quote}\n\n[第 ${sourcePage} 页 · 返回原文](research://attachment/${attachmentId}?page=${sourcePage})\n\n`});
+    const pages: Data[] = captured.pages || [captured];
+    const content = pages.map(source => {
+      const sourcePage = source.page || page, quote = String(source.quote).trim().replace(/\r?\n/g, '\n> ');
+      return `> ${quote}\n\n[第 ${sourcePage} 页 · 返回原文](research://attachment/${attachmentId}?page=${sourcePage})\n\n`;
+    }).join('');
+    const range = pages.length > 1 ? `${pages[0].page}–${pages[pages.length - 1].page}` : String(pages[0].page || page);
+    setNoteDraft({itemId: record.itemId, title: `阅读笔记 · 第 ${range} 页`, content});
   }
   async function saveSelectedNote() {
     if (!noteDraft) return;

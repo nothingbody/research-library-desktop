@@ -321,12 +321,15 @@ def export_records(items, fmt):
                 record['year'] = year_of(item)
             else:
                 record.pop('year', None)
+            parts = item.get('issued', {}).get('date-parts', [])
+            if parts and parts[0]:
+                if fmt == 'biblatex' or 'date' in original:
+                    record['date'] = '-'.join(str(p).zfill(4 if index == 0 else 2) for index, p in enumerate(parts[0]))
+            else:
+                record.pop('date', None)
             if fmt == 'biblatex':
                 if record.get('journal'):
                     record['journaltitle'] = record.pop('journal')
-                parts = item.get('issued', {}).get('date-parts', [])
-                if parts and parts[0]:
-                    record['date'] = '-'.join(str(p).zfill(4 if index == 0 else 2) for index, p in enumerate(parts[0]))
             legacy_others = any(a.get('literal') == '等' for a in item.get('author', []))
             authors = ['{' + bib_text(a['literal']) + '}' if a.get('literal') else
                        ', '.join(filter(None, [bib_text(a.get('family')), bib_text(a.get('given'))]))

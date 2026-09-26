@@ -52,6 +52,8 @@ class Backups:
                         db.execute('UPDATE objects SET sha256=?,bytes=? WHERE id=?', (actual_hash, actual_bytes, obj['id']))
                         db.execute("UPDATE attachments SET version=?,text_status='pending',text_json=NULL,page_count=NULL WHERE object_id=?", (actual_hash, obj['id']))
                         db.execute('DELETE FROM document_chunks WHERE attachment_id IN (SELECT id FROM attachments WHERE object_id=?)', (obj['id'],))
+                        for row in db.execute('SELECT DISTINCT item_id FROM attachments WHERE object_id=?', (obj['id'],)).fetchall():
+                            self.library._index(db, row['item_id'])
                     files.append({'objectId': obj['id'], 'path': relative, 'sha256': actual_hash, 'bytes': actual_bytes})
                 db.commit()
             manifest = {'format': 'research-library-backup', 'version': 2, 'createdAt': now(),
@@ -97,26 +99,36 @@ class Backups:
         parent = Path(payload['directory']).resolve()
         require(parent.is_dir(), '恢复目标目录不存在')
         target = parent / ('RestoredLibrary-' + uid()[:8])
-        target.mkdir()
-        shutil.copyfile(Path(verified['path']) / 'library.sqlite3', target / 'library.sqlite3')
-        storage = target / 'storage'
-        storage.mkdir()
-        objects = verified['manifest']['objects']
-        with closing(sqlite3.connect(target / 'library.sqlite3')) as db:
-            for index, obj in enumerate(objects):
-                progress(index / max(1, len(objects)), f'恢复附件 {index + 1}/{len(objects)}')
-                source = within(Path(verified['path']) / obj['path'], verified['path'])
-                destination = within(storage / obj['sha256'][:2] / obj['sha256'], storage)
-                destination.parent.mkdir(exist_ok=True)
-                if not destination.exists():
-                    shutil.copyfile(source, destination)
-                require(sha256(destination) == obj['sha256'], '恢复附件校验失败')
-                db.execute("UPDATE objects SET path=?,mode='managed' WHERE id=?", (str(destination), obj['objectId']))
-            for obj in verified['manifest'].get('unavailableObjects', []):
-                destination = within(storage / obj['sha256'][:2] / obj['sha256'], storage)
-                db.execute("UPDATE objects SET path=?,mode='managed' WHERE id=?", (str(destination), obj['objectId']))
-            db.execute("UPDATE jobs SET state='cancelled',message='从备份恢复，待用户重新运行' WHERE state IN ('pending','running')")
-            db.commit()
-        atomic_json(target / 'restore-complete.json', {'source': verified['path'], 'restoredAt': now(), 'counts': verified['counts']})
+        staging = parent / ('.' + target.name + '-incomplete')
+        require(staging.resolve().parent == parent and target.resolve().parent == parent, '恢复目标目录不安全')
+        staging.mkdir()
+        try:
+            shutil.copyfile(Path(verified['path']) / 'library.sqlite3', staging / 'library.sqlite3')
+            storage = staging / 'storage'
+            storage.mkdir()
+            objects = verified['manifest']['objects']
+            with closing(sqlite3.connect(staging / 'library.sqlite3')) as db:
+                for index, obj in enumerate(objects):
+                    progress(index / max(1, len(objects)), f'恢复附件 {index + 1}/{len(objects)}')
+                    source = within(Path(verified['path']) / obj['path'], verified['path'])
+                    relative = Path('storage') / obj['sha256'][:2] / obj['sha256']
+                    destination = within(staging / relative, storage)
+                    destination.parent.mkdir(exist_ok=True)
+                    if not destination.exists():
+                        shutil.copyfile(source, destination)
+                    require(sha256(destination) == obj['sha256'], '恢复附件校验失败')
+                    db.execute("UPDATE objects SET path=?,mode='managed' WHERE id=?", (str(within(target / relative, target / 'storage')), obj['objectId']))
+                for obj in verified['manifest'].get('unavailableObjects', []):
+                    destination = within(target / 'storage' / obj['sha256'][:2] / obj['sha256'], target / 'storage')
+                    db.execute("UPDATE objects SET path=?,mode='managed' WHERE id=?", (str(destination), obj['objectId']))
+                db.execute("UPDATE jobs SET state='cancelled',message='从备份恢复，待用户重新运行' WHERE state IN ('pending','running')")
+                db.commit()
+            progress(.99, '恢复校验完成，正在保存独立文献库')
+            atomic_json(staging / 'restore-complete.json', {'source': verified['path'], 'restoredAt': now(), 'counts': verified['counts']})
+            staging.rename(target)
+        except Exception:
+            if staging.exists() and staging.resolve().parent == parent and staging.name.endswith('-incomplete'):
+                shutil.rmtree(staging)
+            raise
         return {'path': str(target), 'counts': verified['counts'], 'unavailable': len(verified['manifest'].get('unavailableObjects', [])),
                 'message': '已恢复为独立文献库；缺失附件需重新定位。原库未被覆盖'}

@@ -219,6 +219,8 @@ class Fulltext:
                 try:
                     self.discover(item_id)
                 except AppError as exc:
+                    if exc.code == 'CANCELLED':
+                        raise
                     failures.append(str(exc))
             for row in self.sources(item_id):
                 if row['id'] in tried or (row['origin'] == 'record') != (stage == 'record'):
@@ -232,6 +234,8 @@ class Fulltext:
                     return self.obtain({'itemId': item_id, 'sourceId': row['id']},
                                        lambda amount, message, s=step, h=host: report(s, h, amount, message))
                 except AppError as exc:
+                    if exc.code == 'CANCELLED':
+                        raise
                     failures.append(str(exc) if host in str(exc) else f'{host}：{exc}')
                     if exc.code in ('FULLTEXT_FORBIDDEN', 'FULLTEXT_CHALLENGE'):
                         refused.update(filter(None, (host, (exc.details or {}).get('host'))))

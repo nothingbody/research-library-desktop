@@ -2,7 +2,7 @@
 
 一款面向 **Windows x64** 的本地优先文献管理软件，覆盖文献发现、采集、整理、PDF 阅读、批注、跨文献分析和写作引用。个人文献库与附件保存在自己的电脑上；公开文献检索、开放全文获取和可选的 AI 功能需要联网。
 
-当前版本：**0.9.45**。项目仍在开发中，升级前请先备份个人文献库。软件不是 Scholay、知网、Elsevier、Zotero 或其他学术平台的官方客户端。
+当前版本：**0.9.46**。项目仍在开发中，升级前请先备份个人文献库。软件不是 Scholay、知网、Elsevier、Zotero 或其他学术平台的官方客户端。
 
 ![AI 文献检索结果页：公开书目来源的演示检索](assets/ai-search-results.png)
 
@@ -10,9 +10,9 @@
 
 从 [GitHub Releases](https://github.com/nothingbody/research-library-desktop/releases/latest) 下载 Windows x64 版本：
 
-- [0.9.45 安装版](https://github.com/nothingbody/research-library-desktop/releases/download/v0.9.45/ResearchLibrary-Setup-0.9.45-x64.exe)：安装到电脑并创建快捷方式。
-- [0.9.45 便携版](https://github.com/nothingbody/research-library-desktop/releases/download/v0.9.45/ResearchLibrary-Portable-0.9.45-x64.exe)：无需安装即可启动。
-- [SHA256 校验值](https://github.com/nothingbody/research-library-desktop/releases/download/v0.9.45/SHA256SUMS.txt)：核对下载文件是否完整。
+- [0.9.46 安装版](https://github.com/nothingbody/research-library-desktop/releases/download/v0.9.46/ResearchLibrary-Setup-0.9.46-x64.exe)：安装到电脑并创建快捷方式。
+- [0.9.46 便携版](https://github.com/nothingbody/research-library-desktop/releases/download/v0.9.46/ResearchLibrary-Portable-0.9.46-x64.exe)：无需安装即可启动。
+- [SHA256 校验值](https://github.com/nothingbody/research-library-desktop/releases/download/v0.9.46/SHA256SUMS.txt)：核对下载文件是否完整。
 
 两种版本均自带运行时，无需单独安装 Python 或 Node.js。源码目录不存放预编译安装包；个人文献、论文 PDF 和期刊源数据库不随项目分发。也可以按下方命令自行构建。
 

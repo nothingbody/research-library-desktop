@@ -53,6 +53,7 @@ function FittedParagraph({paragraph, text, scale, alignment}: {paragraph: Transl
 }
 
 export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, scale, rotation, selection, embedded = false, initialSize, notify, fail}: Props) {
+  selection = selection?.pages ? selection.pages.find((value: Data) => value.page === page) || null : selection;
   const canvas = useRef<HTMLCanvasElement>(null), scroll = useRef<HTMLElement>(null), forceNext = useRef(false);
   const alignmentCache = useRef(new Map<string, string>());
   const [layoutState, setLayoutState] = useState<{key: string; value: TranslationLayout}>({key: '', value: EMPTY_LAYOUT});
@@ -90,7 +91,7 @@ export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, sca
     return () => {cancelled = true; task?.cancel();};
   }, [pdf, page, scale, rotation]);
   useEffect(() => {
-    if (!layout.paragraphs.length) return;
+    if (!layout.paragraphs.length) {setChecking(false); return;}
     let cancelled = false, timer: number | undefined;
     setChecking(true); setTranslation(null);
     const force = forceNext.current;
@@ -179,7 +180,7 @@ export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, sca
     <article className="translated-paper" style={{width: size.width, height: size.height}}>
       <canvas ref={canvas}/>
       <div className="translation-mask-layer" aria-hidden="true">
-        {layout.lines.map((line, index) => <div key={index} className="translation-mask" style={{
+        {!skipped && layout.lines.map((line, index) => <div key={index} className="translation-mask" style={{
           left: line.left - 2 * scale, top: line.top - scale, width: line.right - line.left + 4 * scale,
           height: line.bottom - line.top + 2 * scale,
         }}/>)}
@@ -194,7 +195,7 @@ export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, sca
         }}/>) }
       </div>}
       {(rendering || checking || pending || !ready) && <div className="translation-status"><Translate className={rendering || pending ? 'spin' : ''}/>
-        <strong>{rendering || checking ? '正在读取本机译文…' : pending ? '正在翻译当前页…' : skipped ? '中文页面无需翻译' : '当前页还没有译文'}</strong>
+        <strong>{rendering || checking ? '正在读取本机译文…' : pending ? '正在翻译当前页…' : skipped ? '中文页面无需翻译' : layout.paragraphs.length ? '当前页还没有译文' : '此页没有可识别的文字'}</strong>
         <p>{issue || translation?.reason || (layout.paragraphs.length ? '译文完成后将自动保存到本机文献库。' : '此页没有可识别的文字。')}</p>
         {!rendering && !checking && !pending && !skipped && layout.paragraphs.length > 0 && <button onClick={retry}><ArrowClockwise/>重新尝试</button>}
       </div>}
