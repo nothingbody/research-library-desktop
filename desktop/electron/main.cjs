@@ -5,6 +5,7 @@ const path = require('node:path');
 const readline = require('node:readline');
 const {Readable} = require('node:stream');
 const mainLog = require('./main-log.cjs');
+const {assertLibraryOutsideInstallation} = require('./installation-paths.cjs');
 const {startOfficeBridge, PORT: OFFICE_BRIDGE_PORT} = require('./office-bridge.cjs');
 const {createStyleCatalog} = require('./csl-catalog.cjs');
 const {createFulltextFetcher, createHostHandler} = require('./fulltext-fetch.cjs');
@@ -217,6 +218,7 @@ async function fileAction(kind, p) {
   if (kind === 'libraryRoot') {
     const directory = await chooseDirectory('选择文献库目录（可选空目录建立新库）');
     if (!directory) return null;
+    if (app.isPackaged) assertLibraryOutsideInstallation(directory, path.dirname(process.execPath));
     const entries = fs.readdirSync(directory);
     if (entries.length && !entries.includes('library.sqlite3')) throw new Error('请选择空目录或已有文献库目录');
     config.libraryRoot = directory; saveConfig(); delete process.env.RESEARCH_LIBRARY; app.relaunch(); app.quit(); return true;
@@ -344,7 +346,16 @@ if (!app.requestSingleInstanceLock()) app.quit();
 else {
   // The browser extension opens this local-only URI if it cannot reach the
   // capture bridge. It contains no citation data or credentials.
-  app.setAsDefaultProtocolClient(launcherScheme);
+  // Only an installed build owns this launcher. Portable builds run from a
+  // temporary extraction directory that disappears on exit; development and
+  // win-unpacked builds likewise must not replace a working installed entry.
+  const installedLauncher = app.isPackaged && !process.env.PORTABLE_EXECUTABLE_FILE && !process.env.PORTABLE_EXECUTABLE_DIR &&
+    fs.existsSync(path.join(path.dirname(process.execPath), 'Uninstall ResearchLibrary.exe'));
+  if (installedLauncher) {
+    try {
+      if (!app.setAsDefaultProtocolClient(launcherScheme)) mainLog.write('launcher', '无法注册浏览器唤醒入口，请重新安装文献工作台');
+    } catch (error) {mainLog.write('launcher', '无法注册浏览器唤醒入口', error);}
+  }
   app.on('second-instance', () => focusWindow());
   app.on('open-url', (event, url) => {if (url.startsWith(`${launcherScheme}://`)) {event.preventDefault(); focusWindow();}});
   app.whenReady().then(init).catch(error => {mainLog.write('startup', error); dialog.showErrorBox('无法启动文献工作台', `${error.message}\n\n日志：${path.join(app.getPath('userData'), 'main.log')}`); app.exit(1);});

@@ -9,6 +9,7 @@
 /.workbuddy/
 /desktop/node_modules/
 /desktop/dist/
+/desktop/build/install-files.nsh
 
 # Keep local test suites and Electron acceptance scripts out of the public repository.
 /tests_client/

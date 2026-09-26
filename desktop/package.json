@@ -1,6 +1,6 @@
 {
   "name": "research-library-desktop",
-  "version": "0.9.46",
+  "version": "0.9.47",
   "private": true,
   "description": "Local-first research reference manager",
   "author": "Research Library",
@@ -36,6 +36,7 @@
   },
   "build": {
     "appId": "local.research.library",
+    "afterPack": "build/generate-install-manifest.cjs",
     "productName": "文献工作台",
     "protocols": [
       {
@@ -79,6 +80,7 @@
       "signExecutable": false
     },
     "nsis": {
+      "include": "build/installer.nsh",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": false,
