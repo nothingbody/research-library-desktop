@@ -185,16 +185,16 @@ export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, sca
           height: line.bottom - line.top + 2 * scale,
         }}/>)}
       </div>
-      <div className="translation-text-layer">
+      {!skipped && <div className="translation-text-layer">
         {layout.paragraphs.map(paragraph => <FittedParagraph key={paragraph.id} paragraph={paragraph}
           text={String(translations[paragraph.id] || '')} scale={scale} alignment={alignment}/>)}
-      </div>
+      </div>}
       {ready && selection?.page === page && !selectedParagraph && <div className="translation-source-selection" aria-hidden="true">
         {(selection.viewportRects || []).map((rect: number[], index: number) => <div key={index} style={{
           left: rect[0], top: rect[1], width: Math.max(0, rect[2] - rect[0]), height: Math.max(0, rect[3] - rect[1]),
         }}/>) }
       </div>}
-      {(rendering || checking || pending || !ready) && <div className="translation-status"><Translate className={rendering || pending ? 'spin' : ''}/>
+      {!skipped && (rendering || checking || pending || !ready) && <div className="translation-status"><Translate className={rendering || pending ? 'spin' : ''}/>
         <strong>{rendering || checking ? '正在读取本机译文…' : pending ? '正在翻译当前页…' : skipped ? '中文页面无需翻译' : layout.paragraphs.length ? '当前页还没有译文' : '此页没有可识别的文字'}</strong>
         <p>{issue || translation?.reason || (layout.paragraphs.length ? '译文完成后将自动保存到本机文献库。' : '此页没有可识别的文字。')}</p>
         {!rendering && !checking && !pending && !skipped && layout.paragraphs.length > 0 && <button onClick={retry}><ArrowClockwise/>重新尝试</button>}
@@ -202,6 +202,7 @@ export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, sca
       {ready && <footer><small>中文译文 · 第 {page} / {pageCount} 页 · 已存本机{alignment?.pending ? ' · 正在定位选中文本…' : alignment?.error ? ' · ' + alignment.error : ''}</small>
         <button onClick={() => navigator.clipboard.writeText(layout.paragraphs.map(paragraph => translations[paragraph.id]).filter(Boolean).join('\n\n')).then(() => notify('本页译文已复制')).catch(fail)}><Copy/>复制译文</button>
       </footer>}
+      {skipped && <footer><small>中文原文 · 第 {page} / {pageCount} 页 · 无需翻译</small></footer>}
     </article>
   </section>;
 }
