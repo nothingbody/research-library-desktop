@@ -109,14 +109,15 @@ class ResearchAsk:
         source_types = json.loads(row['result_json']).get('sourceTypes') or ['abstract', 'pdf']
         try:
             progress(.1, '正在本地检索所选文献的原文片段')
-            found = self.documents.search({'itemIds': item_ids, 'question': question, 'sourceTypes': source_types, 'limit': 12})
+            found = self.documents.search({'itemIds': item_ids, 'question': question, 'sourceTypes': source_types,
+                                           'limit': max(12, min(30, len(item_ids)))})
             selected = found['chunks']
             if not selected:
                 result = {'claims': [], 'insufficient': '所选材料中没有找到与问题匹配的片段，请调整问题、文献范围或先索引全文。',
-                          'coverage': found['coverage'], 'droppedClaims': 0}
+                          'coverage': found['coverage'], 'evidenceCoverage': found['evidenceCoverage'], 'droppedClaims': 0}
             else:
                 context = {'question': question, 'history': [dict(value) for value in history[-6:] if value['content']][:6],
-                           'sources': selected}
+                           'sources': selected, 'evidenceCoverage': found['evidenceCoverage']}
                 progress(.35, '正在询问已配置的阅读助手模型')
                 raw = self.assistant.research_json(context)
                 for item_id in item_ids:
@@ -144,7 +145,7 @@ class ResearchAsk:
                     else:
                         dropped += 1
                 result = {'claims': claims[:15], 'insufficient': str(raw.get('insufficient') or '').strip()[:1200],
-                          'coverage': found['coverage'], 'droppedClaims': dropped,
+                          'coverage': found['coverage'], 'evidenceCoverage': found['evidenceCoverage'], 'droppedClaims': dropped,
                           'notice': '引用原句与来源归属已校验；结论含义仍需研究者核对。'}
                 if not claims and not result['insufficient']:
                     result['insufficient'] = '模型没有提供可核对的原文引用，本次不生成结论。'

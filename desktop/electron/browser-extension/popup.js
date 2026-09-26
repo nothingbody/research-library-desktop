@@ -1,7 +1,7 @@
 const apiRoot = 'http://127.0.0.1:28886/api/browser';
 const launcherUrl = 'researchlibrary://browser-capture';
 const element = id => document.getElementById(id);
-let token = '', pageUrl = '', duplicateTimer = 0, duplicateSequence = 0, nativeDownloads = [];
+let token = '', pageUrl = '', activeTabId = 0, duplicateTimer = 0, duplicateSequence = 0, nativeDownloads = [], batchRecords = [];
 function message(value, kind = '') {const node = element('message'); node.textContent = value; node.className = kind;}
 async function request(path, method = 'GET', body) {
   const response = await fetch(apiRoot + path, {method, headers: {'Content-Type': 'application/json', 'X-Research-Browser': token}, body: body ? JSON.stringify(body) : undefined});
@@ -65,9 +65,8 @@ function extract() {
       ...(venue ? [`期刊：${venue}`] : [])
     ];
     const rows = [...document.querySelectorAll('tr')].filter(row => row.querySelector('td.name a, td.name a.fz14'));
-    const chosen = rows.find(row => row.querySelector('input.cbItem:checked, input[type="checkbox"]:checked')) || (rows.length === 1 ? rows[0] : null);
-    if (rows.length && !chosen) return {requiresSelection: true};
-    if (chosen) {
+    const selected = rows.filter(row => row.querySelector('input.cbItem:checked, input[type="checkbox"]:checked'));
+    const fromRow = chosen => {
       const titleLink = chosen.querySelector('td.name a, td.name a.fz14');
       const title = cleanText(titleLink?.textContent);
       if (!title) return null;
@@ -78,7 +77,9 @@ function extract() {
         authors: [...chosen.querySelectorAll('td.author a')].map(author => cleanText(author.textContent)).filter(Boolean),
         year: (cleanText(chosen.querySelector('td.date')?.textContent).match(/(?:19|20)\d{2}/) || [])[0] || '', DOI: '',
         venue, abstract: '', pdfUrl: '', tags: classification(type, venue), nativeDownloads: [], cnkiDetailUrl: href};
-    }
+    };
+    if (rows.length > 1) return {candidates: rows.slice(0, 50).map(row => ({...fromRow(row), selected: selected.length ? selected.includes(row) : true})).filter(row => row.title)};
+    if (rows.length === 1) return fromRow(rows[0]);
     const titleNode = document.querySelector('.brief h1, .wx-tit h1, #chTitle');
     const title = cleanText(titleNode?.textContent);
     if (!title) return null;
@@ -97,11 +98,93 @@ function extract() {
   const values = name => metas.filter(meta => (meta.getAttribute('name') || meta.getAttribute('property') || '').toLowerCase() === name.toLowerCase())
     .map(meta => (meta.getAttribute('content') || '').trim()).filter(Boolean);
   const first = (...names) => names.flatMap(values)[0] || '';
+  const absolute = value => {try {const url = new URL(String(value || ''), location.href); return /^https?:$/.test(url.protocol) ? url.href : '';} catch {return '';}};
+  const doiValue = value => (String(value || '').match(/10\.\d{4,9}\/[^\s<>"?#]+/i) || [])[0] || '';
+  const structured = [];
+  const addStructured = record => {
+    if (!record?.title) return;
+    const key = doiValue(record.DOI) || cleanText(record.title).toLowerCase();
+    if (structured.some(item => (doiValue(item.DOI) || cleanText(item.title).toLowerCase()) === key)) return;
+    structured.push(record);
+  };
+  const jsonNodes = [...document.querySelectorAll('script[type="application/ld+json"]')];
+  const visitJson = (node, depth = 0) => {
+    if (!node || depth > 5) return;
+    if (Array.isArray(node)) {node.forEach(value => visitJson(value, depth + 1)); return;}
+    if (typeof node !== 'object') return;
+    if (node['@graph']) visitJson(node['@graph'], depth + 1);
+    const kinds = [node['@type']].flat().map(value => String(value || '').toLowerCase());
+    const type = kinds.some(value => /scholarlyarticle/.test(value)) ? 'article-journal' :
+      kinds.some(value => /book/.test(value)) ? 'book' : kinds.some(value => /thesis/.test(value)) ? 'thesis' :
+      kinds.some(value => /article/.test(value)) ? 'webpage' : '';
+    if (!type || !cleanText(node.headline || node.name)) return;
+    const authors = [node.author].flat().filter(Boolean).map(value => cleanText(typeof value === 'string' ? value :
+      value.name || [value.givenName, value.familyName].filter(Boolean).join(' '))).filter(Boolean);
+    const part = node.isPartOf || node.publication || {};
+    const venue = type === 'book' ? '' : cleanText(typeof part === 'string' ? part : part.name || '');
+    const identifier = [node.doi, node.identifier, node.sameAs].flat().find(value => doiValue(typeof value === 'string' ? value : value?.value || value?.['@id'])) || '';
+    const encoding = [node.encoding, node.associatedMedia].flat().find(value => value && /pdf/i.test(String(value.encodingFormat || value.fileFormat || value.contentUrl || '')));
+    addStructured({pageUrl: absolute(node.url || node.mainEntityOfPage?.['@id'] || node.mainEntityOfPage) || location.href,
+      type, title: cleanText(node.headline || node.name), authors,
+      year: (String(node.datePublished || node.dateCreated || '').match(/(?:19|20)\d{2}/) || [])[0] || '',
+      DOI: doiValue(typeof identifier === 'string' ? identifier : identifier?.value), venue,
+      publisher: cleanText(typeof node.publisher === 'string' ? node.publisher : node.publisher?.name), ISBN: cleanText(node.isbn),
+      abstract: cleanText(node.abstract || node.description), pdfUrl: absolute(encoding?.contentUrl), tags: []});
+  };
+  for (const script of jsonNodes) {try {visitJson(JSON.parse(script.textContent || ''));} catch {}}
+  for (const node of document.querySelectorAll('span.Z3988[title], abbr.Z3988[title]')) {
+    const raw = node.getAttribute('title') || '';
+    const query = new URL('https://coins.invalid/?' + raw).searchParams;
+    const title = cleanText(query.get('rft.atitle') || query.get('rft.title') || query.get('rft.btitle'));
+    if (!title) continue;
+    const authors = query.getAll('rft.au').map(cleanText).filter(Boolean);
+    if (!authors.length && query.get('rft.aulast')) authors.push(cleanText([query.get('rft.aulast'), query.get('rft.aufirst')].filter(Boolean).join(', ')));
+    const contextLink = node.closest?.('article, li, tr, .gs_r, .result, .search-result')?.querySelector?.('a[href]');
+    const coinsType = /book/i.test(query.get('rft.genre') || '') ? 'book' : /article/i.test(query.get('rft.genre') || '') ? 'article-journal' : 'document';
+    addStructured({pageUrl: absolute(contextLink?.href) || location.href,
+      type: coinsType,
+      title, authors, year: ((query.get('rft.date') || '').match(/(?:19|20)\d{2}/) || [])[0] || '',
+      DOI: doiValue(query.getAll('rft_id').join(' ') + ' ' + (query.get('rft.doi') || '')),
+      venue: coinsType === 'book' ? '' : cleanText(query.get('rft.jtitle') || query.get('rft.btitle')), publisher: cleanText(query.get('rft.pub')),
+      ISBN: cleanText(query.get('rft.isbn')), abstract: '', pdfUrl: '', tags: []});
+  }
+  // Google Scholar result pages expose neither citation_* nor a stable article
+  // API. Capture visible result cards and let the user review titles before import.
+  if (/^scholar\.google\./i.test(location.hostname)) {
+    for (const card of document.querySelectorAll('.gs_r.gs_or.gs_scl')) {
+      const link = card.querySelector('.gs_rt a[href]');
+      const title = cleanText(link?.textContent || card.querySelector('.gs_rt')?.textContent).replace(/^\[[^\]]+\]\s*/, '');
+      if (!title) continue;
+      const byline = cleanText(card.querySelector('.gs_a')?.textContent);
+      addStructured({pageUrl: absolute(link?.href) || location.href, type: 'document', title,
+        authors: byline.split(/\s+[-–]\s+/)[0].split(/[,，]/).map(cleanText).filter(Boolean),
+        year: (byline.match(/(?:19|20)\d{2}/) || [])[0] || '', DOI: '', venue: '',
+        abstract: cleanText(card.querySelector('.gs_rs')?.textContent), pdfUrl: '', tags: []});
+    }
+  }
+  if (!first('citation_title') && structured.length > 1) {
+    const candidates = structured.map(record => ({...record,
+      pageUrl: record.pageUrl === location.href && record.DOI ? `https://doi.org/${record.DOI}` : record.pageUrl}))
+      .filter(record => record.pageUrl !== location.href || /^https?:\/\/doi\.org\/10\./i.test(record.pageUrl));
+    if (candidates.length) return {candidates: candidates.slice(0, 50)};
+  }
+  const citationTitle = cleanText(first('citation_title')).toLowerCase();
+  const item = (citationTitle ? structured.find(record => cleanText(record.title).toLowerCase() === citationTitle) : structured[0]) || {};
+  const unapiNode = document.querySelector('abbr.unapi-id[title], span.unapi-id[title]');
+  const unapiLink = document.querySelector('link[rel="unapi-server"][href]');
+  const unapiServer = absolute(unapiLink?.href);
+  const unapiId = cleanText(unapiNode?.getAttribute('title'));
+  const risLink = !first('citation_title') && !item.title ? [...document.querySelectorAll('link[rel="alternate"][href], a[href]')].find(link => {
+    const url = absolute(link.href);
+    if (!url || new URL(url).origin !== new URL(location.href).origin) return false;
+    return /(?:\.ris(?:$|[?#])|[?&](?:format|type)=ris(?:&|$))/i.test(url) ||
+      /research-info-systems|x-ris/i.test(link.getAttribute('type') || '');
+  }) : null;
   const rawDate = first('citation_date','citation_publication_date','citation_online_date','dc.date','prism.publicationdate','article:published_time');
   const currentUrl = new URL(location.href);
   const pathDoi = (() => {try {return (decodeURIComponent(currentUrl.pathname).match(/\/(?:article|articles|doi\/(?:full|abs|pdf|epdf))\/(10\.\d{4,9}\/[^/?#]+)/i) || [])[1] || '';} catch {return '';}})();
   const queryDoi = /^10\.\d{4,9}\/\S+$/i.test(currentUrl.searchParams.get('id') || '') ? currentUrl.searchParams.get('id') : '';
-  const doi = (first('citation_doi','dc.identifier.doi','prism.doi') || pathDoi || queryDoi)
+  const doi = (first('citation_doi','dc.identifier.doi','prism.doi') || item.DOI || pathDoi || queryDoi)
     .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i,'').trim();
   const pdf = first('citation_pdf_url','dc.identifier.pdf');
   const href = document.querySelector('link[type="application/pdf"]')?.href || '';
@@ -191,22 +274,68 @@ function extract() {
   const directPdf = document.contentType === 'application/pdf' || /\.pdf(?:$|[?#])/i.test(location.pathname) ||
     /\/(?:pdfdirect|epdf|pdfft)(?:\/|$)/i.test(location.pathname) || (arxiv && /^\/pdf\//i.test(location.pathname));
   const detectedPdfUrl = directPdf ? location.href : pdfUrl;
-  const authors = values('citation_author').length ? values('citation_author') : values('dc.creator');
-  const year = (rawDate.match(/(?:19|20)\d{2}/) || [])[0] || '';
+  const authors = values('citation_author').length ? values('citation_author') : values('dc.creator').length ? values('dc.creator') : item.authors || [];
+  const year = (rawDate.match(/(?:19|20)\d{2}/) || [])[0] || item.year || '';
   const recognizedJournal = !!pdfUrl && ['link.springer.com', 'onlinelibrary.wiley.com', 'tandfonline.com',
     'journals.sagepub.com', 'pubs.acs.org', 'mdpi.com', 'frontiersin.org', 'journals.plos.org',
     'pmc.ncbi.nlm.nih.gov', 'academic.oup.com', 'cambridge.org', 'sciencedirect.com'].some(isHost);
   const type = first('citation_conference_title') ? 'paper-conference' : first('citation_dissertation_institution') ? 'thesis' : first('citation_book_title') ? 'book' :
-    first('citation_journal_title') || recognizedJournal ? 'article-journal' : directPdf || (arxiv && !!first('citation_arxiv_id')) ? 'document' : 'webpage';
-  const browserDownload = !!detectedPdfUrl;
-  return {pageUrl: location.href, type, title: first('citation_title','dc.title','og:title') || document.title.replace(/\s+[|–-]\s+[^|–-]+$/, '').trim(),
+    first('citation_journal_title') || recognizedJournal ? 'article-journal' : item.type || (directPdf || (arxiv && !!first('citation_arxiv_id')) ? 'document' : 'webpage');
+  const browserDownload = !!(detectedPdfUrl || item.pdfUrl);
+  return {pageUrl: item.pageUrl || location.href, type, title: first('citation_title','dc.title') || item.title || first('og:title') || document.title.replace(/\s+[|–-]\s+[^|–-]+$/, '').trim(),
     authors, year, DOI: doi,
-    venue: first('citation_journal_title','citation_conference_title','prism.publicationname'),
-    abstract: first('citation_abstract','dc.description','description'),
-    pdfUrl: detectedPdfUrl,
+    venue: first('citation_journal_title','citation_conference_title','prism.publicationname') || item.venue || '',
+    abstract: first('citation_abstract','dc.description','description') || item.abstract || '',
+    publisher: item.publisher || '', ISBN: first('citation_isbn') || item.ISBN || '',
+    pdfUrl: detectedPdfUrl || item.pdfUrl || '',
     fulltextNote: browserDownload ? '已识别当前论文的 PDF 入口；浏览器会使用当前站点会话下载，完成后验证并导入。' : fulltextNote,
-    tags: [], nativeDownloads: [], browserDownload};
+    tags: [], nativeDownloads: [], browserDownload, unapiServer, unapiId, risUrl: absolute(risLink?.href)};
  }
+async function enrichRis(url) {
+  const target = new URL(url, location.href);
+  if (target.origin !== location.origin || !/^https?:$/.test(target.protocol)) return null;
+  const response = await fetch(target.href, {credentials: 'same-origin'});
+  if (!response.ok) return null;
+  const text = await response.text();
+  if (text.length > 500000 || !/^TY\s{1,2}-/m.test(text)) return null;
+  const fields = {};
+  for (const line of text.split(/\r?\n/)) {
+    const match = /^([A-Z][A-Z0-9])\s{1,2}-\s?(.*)$/.exec(line);
+    if (!match) continue;
+    (fields[match[1]] ||= []).push(match[2].trim());
+  }
+  const first = (...keys) => keys.flatMap(key => fields[key] || [])[0] || '';
+  const title = first('TI', 'T1');
+  if (!title) return null;
+  const kind = first('TY');
+  return {title, authors: fields.AU || fields.A1 || [], year: (first('PY', 'Y1').match(/(?:19|20)\d{2}/) || [])[0] || '',
+    DOI: first('DO'), venue: first('JO', 'JF', 'T2'), abstract: first('AB', 'N2'),
+    type: kind === 'BOOK' ? 'book' : kind === 'THES' ? 'thesis' : kind === 'JOUR' ? 'article-journal' : 'document',
+    ISBN: kind === 'BOOK' ? first('SN') : '', publisher: first('PB')};
+}
+async function enrichUnapi(server, id) {
+  const target = new URL(server, location.href);
+  if (target.origin !== location.origin || !/^https?:$/.test(target.protocol) || !id || id.length > 500) return null;
+  target.searchParams.set('id', id);
+  target.searchParams.set('format', 'mods');
+  const response = await fetch(target.href, {credentials: 'same-origin'});
+  if (!response.ok || !/xml|mods/i.test(response.headers.get('Content-Type') || '')) return null;
+  const xml = await response.text();
+  if (xml.length > 500000) return null;
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  if (doc.querySelector('parsererror')) return null;
+  const nodes = name => [...doc.getElementsByTagNameNS('*', name)];
+  const first = name => nodes(name)[0]?.textContent?.replace(/\s+/g, ' ').trim() || '';
+  const title = first('title');
+  if (!title) return null;
+  const authors = nodes('name').map(node => [...node.getElementsByTagNameNS('*', 'namePart')]
+    .map(part => part.textContent?.trim()).filter(Boolean).join(' ')).filter(Boolean);
+  const doi = nodes('identifier').find(node => node.getAttribute('type')?.toLowerCase() === 'doi')?.textContent?.trim() || '';
+  const hostItem = nodes('relatedItem').find(node => node.getAttribute('type') === 'host');
+  const venue = hostItem?.getElementsByTagNameNS('*', 'title')[0]?.textContent?.trim() || '';
+  return {title, authors, year: (first('dateIssued').match(/(?:19|20)\d{2}/) || [])[0] || '', DOI: doi,
+    venue, abstract: first('abstract'), type: /book/i.test(first('genre')) ? 'book' : 'article-journal'};
+}
 async function enrichCnkiDetail(detailUrl) {
   // This runs in the current CNKI tab's isolated world. It uses the browser's
   // existing authenticated request context but never reads cookies or credentials.
@@ -243,6 +372,7 @@ async function currentPage() {
   const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
   if (!tab || !/^https?:\/\//i.test(tab.url || '')) throw Error('请打开论文网页或公开 PDF 后再保存');
   pageUrl = tab.url;
+  activeTabId = tab.id;
   let result;
   try {[{result}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, func: extract});}
   catch {const url = new URL(tab.url), path = url.pathname;
@@ -252,8 +382,25 @@ async function currentPage() {
     return {pageUrl: tab.url, type: isPdf ? 'document' : 'webpage', title: decodeURIComponent(path.split('/').pop() || tab.title || '网页文献').replace(/\.pdf$/i,''),
       authors: [], year: '', DOI: '', venue: '', abstract: '', pdfUrl: isPdf ? tab.url : '', browserDownload: isPdf};}
   if (!result || typeof result !== 'object') throw Error('未能从当前页面读取题录，请打开文章详情页后重试。');
-  if (result.requiresSelection) throw Error('知网结果页包含多篇文献，请先勾选一篇后再保存；也可打开该文献详情页。');
+  if (Array.isArray(result.candidates)) return result;
   pageUrl = result.pageUrl || tab.url;
+  if (result.unapiServer && result.unapiId) {
+    try {
+      const [{result: detail}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, func: enrichUnapi, args: [result.unapiServer, result.unapiId]});
+      if (detail) result = {...result, title: detail.title || result.title, authors: detail.authors?.length ? detail.authors : result.authors,
+        year: detail.year || result.year, DOI: detail.DOI || result.DOI, venue: detail.venue || result.venue,
+        abstract: detail.abstract || result.abstract, type: detail.type || result.type};
+    } catch {}
+  }
+  if (result.risUrl) {
+    try {
+      const [{result: detail}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, func: enrichRis, args: [result.risUrl]});
+      if (detail) result = {...result, title: detail.title || result.title, authors: detail.authors?.length ? detail.authors : result.authors,
+        year: detail.year || result.year, DOI: detail.DOI || result.DOI, venue: detail.venue || result.venue,
+        abstract: detail.abstract || result.abstract, type: detail.type || result.type,
+        ISBN: detail.ISBN || result.ISBN, publisher: detail.publisher || result.publisher};
+    } catch {}
+  }
   if (result.cnkiDetailUrl) {
     try {
       const [{result: details}] = await chrome.scripting.executeScript({target: {tabId: tab.id}, func: enrichCnkiDetail, args: [result.cnkiDetailUrl]});
@@ -283,6 +430,9 @@ function fill(data) {
   element('year').value = data.year || '';
   element('doi').value = data.DOI || '';
   element('venue').value = data.venue || '';
+  element('publisher').value = data.publisher || '';
+  element('isbn').value = data.ISBN || '';
+  element('book-fields').hidden = element('type').value !== 'book';
   element('abstract').value = data.abstract || '';
   element('pdf').value = data.pdfUrl || '';
   element('pdf-label').textContent = data.pdfUrl ? '已识别的 PDF 入口' : 'PDF 地址';
@@ -313,6 +463,7 @@ function scheduleDuplicateCheck() {
   }, 350);
 }
 for (const name of ['title', 'authors', 'year', 'doi']) element(name).addEventListener('input', scheduleDuplicateCheck);
+element('type').addEventListener('change', () => {element('book-fields').hidden = element('type').value !== 'book';});
 function syncFulltextMode(hasPdf) {
   const mode = element('fulltext-mode');
   for (const option of mode.options) if (option.value !== 'none') option.disabled = !hasPdf;
@@ -322,13 +473,15 @@ function syncFulltextMode(hasPdf) {
 element('pdf').addEventListener('input', () => syncFulltextMode(!!element('pdf').value.trim()));
 async function collections() {
   const {collections} = await request('/collections');
-  const select = element('collection'), selected = select.value;
-  select.replaceChildren(new Option('我的文献',''));
-  for (const item of collections) select.add(new Option(item.name, item.id));
-  select.value = selected;
+  for (const id of ['collection', 'batch-collection']) {
+    const select = element(id), selected = select.value;
+    select.replaceChildren(new Option('我的文献',''));
+    for (const item of collections) select.add(new Option(item.name, item.id));
+    select.value = selected;
+  }
 }
-function downloadInBrowser(choice, itemId, ticket) {
-  return new Promise((resolve, reject) => chrome.runtime.sendMessage({type: 'download-browser', token, ticket, itemId, pageUrl, url: choice.url, format: choice.format, title: element('title').value.trim()}, response => {
+function downloadInBrowser(choice, itemId, ticket, title = element('title').value.trim(), sourceUrl = pageUrl) {
+  return new Promise((resolve, reject) => chrome.runtime.sendMessage({type: 'download-browser', token, ticket, itemId, pageUrl: sourceUrl, url: choice.url, format: choice.format, title}, response => {
     const error = chrome.runtime.lastError;
     if (error) return reject(Error(error.message));
     if (!response?.ok) return reject(Error(response?.error || '无法启动浏览器下载'));
@@ -336,10 +489,72 @@ function downloadInBrowser(choice, itemId, ticket) {
   }));
 }
 async function showRecord() {
-  element('connection').hidden = true; element('record').hidden = false;
+  element('connection').hidden = true;
   await collections();
-  try {const data = await currentPage(); fill(data); return data;} catch (error) {element('save').disabled = true; message(error.message,'error'); return null;}
+  try {
+    const data = await currentPage();
+    if (data?.candidates?.length) {showBatch(data.candidates); return data;}
+    element('batch').hidden = true; element('record').hidden = false;
+    fill(data); return data;
+  } catch (error) {element('save').disabled = true; message(error.message,'error'); return null;}
 }
+function showBatch(candidates) {
+  batchRecords = candidates.slice(0, 50);
+  element('record').hidden = true; element('batch').hidden = false;
+  element('batch-summary').textContent = `当前页识别到 ${batchRecords.length} 篇文献。勾选需要保存的条目：`;
+  const list = element('batch-items'); list.replaceChildren();
+  for (const [index, record] of batchRecords.entries()) {
+    const row = document.createElement('label'); row.className = 'batch-row';
+    const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.value = String(index); checkbox.checked = record.selected !== false;
+    const text = document.createElement('span'); text.textContent = record.title;
+    const byline = document.createElement('small'); byline.textContent = [record.authors?.slice(0, 2).join('; '), record.year, record.venue].filter(Boolean).join(' · ');
+    text.append(byline); row.append(checkbox, text); list.append(row);
+  }
+}
+element('batch-save').addEventListener('click', async () => {
+  const button = element('batch-save');
+  const selected = [...element('batch-items').querySelectorAll('input:checked')].map(node => batchRecords[Number(node.value)]).filter(Boolean);
+  if (!selected.length) {message('请至少勾选一篇文献', 'error'); return;}
+  button.disabled = true;
+  let created = 0, existing = 0, downloads = 0;
+  const failures = [], downloadFailures = [];
+  try {
+    for (const [index, original] of selected.entries()) {
+      message(`正在保存第 ${index + 1} / ${selected.length} 篇：${original.title}`);
+      let record = original;
+      if (record.cnkiDetailUrl) {
+        try {
+          const [{result: detail}] = await chrome.scripting.executeScript({target: {tabId: activeTabId}, func: enrichCnkiDetail, args: [record.cnkiDetailUrl]});
+          record = {...record, title: detail.title || record.title, authors: detail.authors?.length ? detail.authors : record.authors,
+            year: detail.year || record.year, venue: detail.venue || record.venue, abstract: detail.abstract || record.abstract,
+            tags: [...new Set([...(record.tags || []), ...(detail.keywords || []).map(value => `关键词：${value}`)])],
+            nativeDownloads: detail.downloads || []};
+        } catch {}
+      }
+      try {
+        const browserChoice = record.nativeDownloads?.find(value => value.format === 'pdf') ||
+          (record.pdfUrl ? {url: record.pdfUrl, format: 'pdf'} : null);
+        const response = await request('/capture', 'POST', {pageUrl: record.pageUrl, collectionId: element('batch-collection').value || null,
+          pdfUrl: record.pdfUrl || '', downloadPdf: !!browserChoice, browserDownload: !!browserChoice,
+          browserDownloadUrl: browserChoice?.url || '',
+          data: {type: record.type || 'document', title: record.title, author: record.authors || [], year: record.year || '', DOI: record.DOI || '',
+            'container-title': record.venue || '', publisher: record.publisher || '', ISBN: record.ISBN || '',
+            abstract: record.abstract || '', tags: record.tags || []}});
+        if (response.created) created++; else existing++;
+        if (browserChoice && !response.pdfAlreadyAttached && !response.downloadSkippedOffline) {
+          try {
+            await downloadInBrowser(browserChoice, response.itemId, response.downloadTicket, record.title, record.pageUrl);
+            downloads++;
+          } catch (error) {downloadFailures.push(`${record.title}：${error.message || '下载未启动'}`);}
+        }
+      } catch (error) {failures.push(`${record.title}：${error.message || '保存失败'}`);}
+    }
+    message(`批量采集完成：新增 ${created} 篇，已存在 ${existing} 篇，启动全文下载 ${downloads} 篇` +
+      `${failures.length ? `；保存失败 ${failures.length} 篇：${failures.slice(0, 2).join('；')}` : ''}` +
+      `${downloadFailures.length ? `；下载未启动 ${downloadFailures.length} 篇：${downloadFailures.slice(0, 2).join('；')}` : ''}。`,
+      failures.length || downloadFailures.length ? 'error' : 'success');
+  } finally {button.disabled = false;}
+});
 async function showLastDownload() {
   const {downloadStatus} = await chrome.storage.local.get('downloadStatus');
   await chrome.action.setBadgeText({text: ''}).catch(() => {});
@@ -393,6 +608,7 @@ element('save').addEventListener('click', async () => {
       browserDownloadUrl: browserChoice?.url || '',
       data: {type: element('type').value, title, author: authors, year, DOI: element('doi').value.trim(),
         'container-title': element('venue').value.trim(), abstract: element('abstract').value.trim(),
+        publisher: element('publisher').value.trim(), ISBN: element('isbn').value.trim(),
         tags: (element('classification').textContent || '').split(' · ').map(value => value.trim()).filter(Boolean)}});
     let browserError = '';
     if (useBrowser && browserChoice && !result.pdfAlreadyAttached && !result.downloadSkippedOffline) {

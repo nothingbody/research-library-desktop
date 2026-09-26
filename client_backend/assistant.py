@@ -7,6 +7,7 @@ from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
 
 from .common import AppError, dumps, now, require, uid
+from .language import chinese_page
 
 
 TRANSLATION_POLICY_VERSION = 2
@@ -407,6 +408,8 @@ termMappings是term和translation对象数组。调度优化中的代理模型�
                 attachment = db.execute('SELECT id FROM attachments WHERE id=? AND item_id=?',
                                         (attachment_id, item_id)).fetchone()
                 require(attachment, '该 PDF 不属于当前文献')
+                if chinese_page(' '.join(segment['text'] for segment in segments)):
+                    return {'state': 'skipped', 'sourceHash': source_hash, 'reason': '中文页面无需翻译'}
                 if not force:
                     cached = db.execute('''SELECT translations_json FROM translation_pages
                         WHERE attachment_id=? AND page=? AND source_hash=?''', (attachment_id, page, source_hash)).fetchone()

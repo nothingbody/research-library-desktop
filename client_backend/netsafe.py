@@ -5,10 +5,14 @@ are checked before a request is sent to the next location.
 """
 from __future__ import annotations
 
+import email.message
 import http.client
 import ipaddress
 import json
+import os
+import shutil
 import socket
+import tempfile
 from urllib import error, parse, request
 
 from .common import AppError, require
@@ -149,21 +153,106 @@ class _RedirectHandler(request.HTTPRedirectHandler):
 _OPENER = request.build_opener(request.ProxyHandler({}), _HTTPHandler(), _HTTPSHandler(), _RedirectHandler())
 
 
-def open_url(url, accept='application/pdf,text/html', timeout=30):
+# Many publisher CDNs answer HTTP 403 to clients that do not look like a
+# browser, open-access PDFs included. Use a browser-compatible User-Agent that
+# still names the app (as Zotero does), plus the headers a browser sends.
+_USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+               'Chrome/152.0.0.0 Safari/537.36 ResearchLibrary/0.9')
+
+
+_host_bridge = None
+
+
+def set_host_bridge(bridge):
+    """Route browser-type fetches through the Electron main process (Chromium's network stack)."""
+    global _host_bridge
+    _host_bridge = bridge
+
+
+def _http_error(status, url):
+    host = parse.urlsplit(url).hostname or ''
+    if status in (401, 403):
+        return AppError('FULLTEXT_FORBIDDEN', f'{host} 拒绝程序直接下载（HTTP {status}），常见于出版社的防爬限制，与是否开放获取无关。'
+                        '可在浏览器中打开后用扩展保存，或手动导入 PDF', details={'host': host})
+    if status == 404:
+        return AppError('FULLTEXT_NOT_FOUND', '全文链接不存在（HTTP 404）')
+    if status == 429:
+        return AppError('FULLTEXT_RATE_LIMITED', '网站限制访问频率（HTTP 429），请稍后重试', retryable=True)
+    return AppError('FULLTEXT_HTTP', f'网站返回 HTTP {status}', retryable=status >= 500)
+
+
+class _HostResponse:
+    """A body the main process already downloaded, read like an urllib response."""
+
+    def __init__(self, folder, final_url, content_type, size):
+        self._folder, self._path, self._url = folder, os.path.join(folder, 'body.part'), final_url
+        self._file = open(self._path, 'rb')
+        self.headers = email.message.Message()
+        self.headers['Content-Type'] = content_type or 'application/octet-stream'
+        self.headers['Content-Length'] = str(size)
+
+    def geturl(self):
+        return self._url
+
+    def read(self, amount=-1):
+        return self._file.read(amount)
+
+    def keep(self, target):
+        """Move the complete body to target; the caller then owns that file."""
+        self._file.close()
+        shutil.move(self._path, target)
+        return str(target)
+
+    def close(self):
+        self._file.close()
+        shutil.rmtree(self._folder, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _open_via_host(url, accept, timeout, referer, max_bytes, progress):
+    folder = tempfile.mkdtemp(prefix='rl-fetch-')
+    try:
+        result = _host_bridge.call('fulltext.fetch', {
+            'url': url, 'accept': accept, 'referer': referer or '', 'maxBytes': int(max_bytes),
+            'savePath': os.path.join(folder, 'body.part'), 'timeoutMs': int(timeout * 1000)},
+            timeout=timeout + 60, progress=progress)
+        final_url = public_url(result.get('finalUrl') or url)
+        status = int(result.get('status') or 0)
+        if not 200 <= status < 300:
+            raise _http_error(status, final_url)
+        return _HostResponse(folder, final_url, result.get('contentType'), int(result.get('bytes') or 0))
+    except BaseException:
+        shutil.rmtree(folder, ignore_errors=True)
+        raise
+
+
+def open_url(url, accept='application/pdf,text/html', timeout=30, referer='', browser=False,
+             max_bytes=512 * 1024 * 1024, progress=None):
+    """browser=True: fetch like a browser would (full-text pages and PDFs). Inside the
+    desktop app this runs on Chromium's network stack in the main process, which
+    passes the CDN checks urllib fails; the response is then file-backed."""
     url = public_url(url)
-    req = request.Request(url, headers={'User-Agent': 'ResearchLibrary/0.9', 'Accept': accept})
+    if browser and _host_bridge is not None:
+        return _open_via_host(url, accept, max(timeout, 180), referer, max_bytes, progress)
+    headers = {'User-Agent': _USER_AGENT, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+               'Accept': accept if 'json' in accept else accept + ',*/*;q=0.8'}
+    if referer:
+        try:
+            headers['Referer'] = public_url(referer)
+        except AppError:
+            pass
+    req = request.Request(url, headers=headers)
     try:
         return _OPENER.open(req, timeout=timeout)
     except error.HTTPError as exc:
-        status = exc.code
+        status, final = exc.code, exc.geturl() or url
         exc.close()
-        if status in (401, 403):
-            raise AppError('FULLTEXT_FORBIDDEN', f'网站拒绝下载（HTTP {status}）。请使用浏览器扩展在已登录的页面下载，或手动导入 PDF') from exc
-        if status == 404:
-            raise AppError('FULLTEXT_NOT_FOUND', '全文链接不存在（HTTP 404）') from exc
-        if status == 429:
-            raise AppError('FULLTEXT_RATE_LIMITED', '网站限制访问频率（HTTP 429），请稍后重试', retryable=True) from exc
-        raise AppError('FULLTEXT_HTTP', f'网站返回 HTTP {status}', retryable=status >= 500) from exc
+        raise _http_error(status, final) from exc
     except error.URLError as exc:
         if isinstance(exc.reason, AppError):
             raise exc.reason from exc

@@ -22,6 +22,8 @@ from .library import Library
 from .metadata import lookup
 from .downloads import Downloads
 from .fulltext import Fulltext
+from .host_bridge import HostBridge
+from . import netsafe
 from .documents import Documents
 from .research_ask import ResearchAsk
 from .organization import Organization
@@ -69,6 +71,7 @@ class Application:
         self.jobs.handlers = {
             'import': self.imports.commit,
             'pdf.index': lambda p, progress: self.attachments.index(p['attachmentId'], progress),
+            'caj.convert': lambda p, progress: self.attachments.convert_caj(p['id'], progress, self.jobs),
             'journal.index': self.journals.index,
             'library.index': self.library.rebuild_index,
             'backup': self.backups.create,
@@ -89,7 +92,7 @@ class Application:
         }
         # Assistant tasks wait for Electron to inject the encrypted, memory-only key.
         self.jobs.recover(kinds={'assistant.run', 'ai-search.verify', 'ai-search.rerank', 'research-ask.run'}, submit=False)
-        self.jobs.recover(kinds={'import', 'pdf.index', 'journal.index', 'library.index', 'backup', 'restore', 'pdf.download', 'fulltext.obtain', 'metadata.lookup', 'ai-search.run', 'ai-search.expand', 'ai-search.citations', 'relations.profile', 'relations.run', 'relations.discover'})
+        self.jobs.recover(kinds={'import', 'pdf.index', 'caj.convert', 'journal.index', 'library.index', 'backup', 'restore', 'pdf.download', 'fulltext.obtain', 'metadata.lookup', 'ai-search.run', 'ai-search.expand', 'ai-search.citations', 'relations.profile', 'relations.run', 'relations.discover'})
         settings = self.library.get_settings()
         if settings.get('autoBackup') and settings.get('backupDirectory') and Path(settings['backupDirectory']).is_dir():
             from datetime import datetime, timezone
@@ -102,7 +105,7 @@ class Application:
     def call(self, method, p):
         library, attachments = self.library, self.attachments
         routes = {
-            'app.info': lambda: {'version': '0.9.35', 'root': str(library.root), 'settings': library.get_settings()},
+            'app.info': lambda: {'version': '0.9.45', 'root': str(library.root), 'settings': library.get_settings()},
             'library.stats': library.stats,
             'library.reindex': lambda: self.jobs.create('library.index', {}),
             'items.list': lambda: library.query(p),
@@ -185,6 +188,7 @@ class Application:
             'relations.graphExport': lambda: self.relation_discovery.export_graph(p, self.relations),
             'attachments.download': lambda: self.jobs.create('pdf.download', p),
             'attachments.setRole': lambda: attachments.set_role(p['id'], p['role']),
+            'attachments.convertCaj': lambda: self.jobs.create('caj.convert', {'id': p['id']}),
             'fulltext.sources': lambda: self.fulltext.sources(p['itemId']),
             'fulltext.discover': lambda: self.fulltext.discover(p['itemId']),
             'fulltext.add': lambda: self.fulltext.add(p),
@@ -324,12 +328,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--library', required=True)
     parser.add_argument('--journals')
+    parser.add_argument('--host-bridge', action='store_true', help='Electron main process handles fulltext fetches')
     args = parser.parse_args()
     output_lock = threading.Lock()
     def send(data):
         with output_lock:
             print(dumps(data), flush=True)
     application = Application(args.library, lambda event, data: send({'event': event, 'data': data}), args.journals)
+    bridge = HostBridge(send) if args.host_bridge else None
+    netsafe.set_host_bridge(bridge)
     send({'event': 'ready', 'data': {'root': str(application.library.root)}})
     pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='rpc')
     def handle(request):
@@ -348,12 +355,18 @@ def main():
                 continue
             try:
                 request = json.loads(line)
+                if 'hostReply' in request or 'hostProgress' in request:
+                    if bridge:
+                        bridge.deliver(request['hostReply']) if 'hostReply' in request else bridge.progress(request['hostProgress'])
+                    continue
                 if request.get('method') == '_shutdown':
                     break
                 pool.submit(handle, request)
             except ValueError:
                 send({'error': {'code': 'INVALID_JSON', 'message': '请求格式不正确'}})
     finally:
+        if bridge:
+            bridge.close()
         pool.shutdown(wait=True)
         application.close()
 

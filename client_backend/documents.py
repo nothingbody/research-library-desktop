@@ -119,27 +119,43 @@ class Documents:
             score = sum(min(body.count(term), 3) for term in terms)
             if score:
                 scored.append((score, dict(row)))
-        scored.sort(key=lambda value: (-value[0], value[1]['item_id'], value[1]['page'] or 0))
+        scored.sort(key=lambda value: (-value[0], value[1]['item_id'], value[1]['page'] or 0, value[1]['start_offset']))
         limit = max(1, min(30, int(payload.get('limit') or 12)))
-        selected = scored[:limit]
+        candidates = list(scored)
         # Chinese questions often have no shared tokens with English abstracts.
         # Within the user's explicit paper scope, include a bounded abstract (or
         # first PDF chunk) for each otherwise unrepresented paper so the model
         # can judge the question against real text and still cite exact quotes.
         if re.search(r'[\u3400-\u9fff]', question):
-            represented = {row['item_id'] for _, row in selected}
+            represented = {row['item_id'] for _, row in candidates}
             for item_id in ids:
                 if item_id in represented:
                     continue
-                candidates = [dict(row) for row in rows if row['item_id'] == item_id]
-                candidates.sort(key=lambda row: ({'abstract': 0, 'pdf': 1, 'reading_card': 2, 'annotation': 3}.get(row['source_type'], 4),
-                                                 row['page'] or 0, row['start_offset']))
-                if candidates:
-                    if len(selected) >= limit:
-                        selected.pop()
-                    selected.append((0, candidates[0]))
+                item_candidates = [dict(row) for row in rows if row['item_id'] == item_id]
+                item_candidates.sort(key=lambda row: ({'abstract': 0, 'pdf': 1, 'reading_card': 2, 'annotation': 3}.get(row['source_type'], 4),
+                                                      row['page'] or 0, row['start_offset']))
+                if item_candidates:
+                    candidates.append((0, item_candidates[0]))
                     represented.add(item_id)
+        # Reserve one excerpt per represented paper before adding more pages
+        # from any single paper. A long PDF must not consume the entire scope.
+        selected, represented = [], set()
+        for candidate in candidates:
+            if candidate[1]['item_id'] not in represented and len(selected) < limit:
+                selected.append(candidate)
+                represented.add(candidate[1]['item_id'])
+        selected_ids = {row['id'] for _, row in selected}
+        for candidate in candidates:
+            if len(selected) >= limit:
+                break
+            if candidate[1]['id'] not in selected_ids:
+                selected.append(candidate)
+        retrieved = {row['item_id'] for _, row in selected}
+        evidence_coverage = {'selectedItemCount': len(ids), 'retrievedItemCount': len(retrieved), 'excerptCount': len(selected),
+                             'retrievedItemIds': [item_id for item_id in ids if item_id in retrieved],
+                             'missingItemIds': [item_id for item_id in ids if item_id not in retrieved]}
         return {'itemIds': ids, 'question': question, 'totalMatches': len(scored), 'coverage': sorted({row['source_type'] for row in rows}),
+                'evidenceCoverage': evidence_coverage,
                 'chunks': [{'id': row['id'], 'itemId': row['item_id'], 'title': row['title'], 'attachmentId': row['attachment_id'],
                             'sourceType': row['source_type'], 'sourceId': row['source_id'], 'sourceVersion': row['source_version'],
                             'page': row['page'], 'startOffset': row['start_offset'], 'quote': row['text'], 'score': score}

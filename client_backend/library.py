@@ -276,6 +276,15 @@ class Library:
             if 'role' not in {row[1] for row in db.execute('PRAGMA table_info(attachments)')}:
                 db.execute("ALTER TABLE attachments ADD COLUMN role TEXT NOT NULL DEFAULT 'main'")
             db.commit()
+        # Rebuild legacy JSON-based PDF tokens once. The marker and FTS writes
+        # share a transaction, so an interrupted upgrade is safe to retry.
+        with self.db(True) as db:
+            marker = db.execute('SELECT value FROM settings WHERE key=?', ('_pdfTextIndexVersion',)).fetchone()
+            if not marker or marker['value'] != dumps(1):
+                item_ids = [row['id'] for row in db.execute('SELECT id FROM items ORDER BY id')]
+                for item_id in item_ids:
+                    self._index(db, item_id, mark_derived=False)
+                db.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)', ('_pdfTextIndexVersion', dumps(1)))
 
     @contextmanager
     def db(self, write=False):
@@ -343,10 +352,18 @@ class Library:
             db.execute('INSERT OR IGNORE INTO tags(id,name) VALUES(?,?)', (tag_id, tag))
             db.execute('INSERT OR IGNORE INTO item_tags VALUES(?,?)', (item_id, tag_id))
 
-    def _index(self, db, item_id):
+    def _index(self, db, item_id, mark_derived=True):
         item = self._get(db, item_id)
         notes = '\n'.join(row[0] + '\n' + row[1] for row in db.execute('SELECT title,content FROM notes WHERE item_id=?', (item_id,)))
-        pages = '\n'.join(row[0] or '' for row in db.execute('SELECT text_json FROM attachments WHERE item_id=?', (item_id,)))
+        page_texts = []
+        for row in db.execute('SELECT text_json FROM attachments WHERE item_id=?', (item_id,)):
+            try:
+                indexed_pages = json.loads(row[0] or '[]')
+            except (TypeError, ValueError):
+                continue
+            if isinstance(indexed_pages, list):
+                page_texts.extend(text for text in indexed_pages if isinstance(text, str))
+        pages = '\n'.join(page_texts)
         card = db.execute('SELECT data FROM reading_cards WHERE item_id=?', (item_id,)).fetchone()
         card_text = ' '.join(str(value) for value in json.loads(card[0]).values()) if card else ''
         terms = '\n'.join('\n'.join(str(row[key]) for key in ('term', 'translation', 'explanation')) for row in db.execute('SELECT term,translation,explanation FROM terms WHERE item_id=?', (item_id,)))
@@ -354,6 +371,8 @@ class Library:
                             str(item.get('DOI', '')), str(item.get('PMID', '')), ' '.join(item.get('tags', [])), notes, pages, card_text, terms])
         db.execute('DELETE FROM item_fts WHERE item_id=?', (item_id,))
         db.execute('INSERT INTO item_fts(item_id,content) VALUES(?,?)', (item_id, norm(content)))
+        if not mark_derived:
+            return
         # Profiles and relationship maps are derived from this local material.
         # Marking them stale keeps old AI interpretations from looking current
         # after an item, card, note, term, or PDF index changes.
@@ -578,12 +597,13 @@ class Library:
         with self.db() as db:
             total = db.execute('SELECT count(*) FROM items i WHERE ' + clause, args).fetchone()[0]
             rows = db.execute(f'''SELECT i.*, (SELECT count(*) FROM attachments WHERE item_id=i.id) AS attachment_count,
-                (SELECT a.id FROM attachments a JOIN objects o ON o.id=a.object_id WHERE a.item_id=i.id AND o.mime='application/pdf' ORDER BY a.created_at LIMIT 1) AS pdf_id
+                (SELECT a.id FROM attachments a JOIN objects o ON o.id=a.object_id WHERE a.item_id=i.id AND o.mime='application/pdf' ORDER BY a.created_at LIMIT 1) AS pdf_id,
+                (SELECT a.id FROM attachments a JOIN objects o ON o.id=a.object_id WHERE a.item_id=i.id AND lower(a.name) LIKE '%.caj' AND o.mime<>'application/pdf' ORDER BY a.created_at LIMIT 1) AS caj_id
                 FROM items i WHERE {clause} ORDER BY {order} {direction},i.id ASC LIMIT ? OFFSET ?''', [*args, limit, offset]).fetchall()
             items = []
             for row in rows:
                 item = self._row_item(row)
-                item.update(attachmentCount=row['attachment_count'], pdfId=row['pdf_id'])
+                item.update(attachmentCount=row['attachment_count'], pdfId=row['pdf_id'], cajId=row['caj_id'])
                 items.append(item)
             return {'items': items, 'total': total, 'offset': offset, 'hasMore': offset + len(items) < total}
 

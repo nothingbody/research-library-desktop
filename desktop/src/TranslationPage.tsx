@@ -64,6 +64,7 @@ export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, sca
   const layout = layoutState.key === renderKey ? layoutState.value : EMPTY_LAYOUT;
   const translations = translation?.translations || {};
   const pending = translation?.state === 'pending';
+  const skipped = translation?.state === 'skipped';
   const ready = translation?.state === 'ready' && layout.paragraphs.length > 0;
   const selectedParagraph = useMemo(() => selection?.page === page ?
     findSelectedParagraph(layout.paragraphs, selection.viewportRects || [], String(selection.quote || '')) : null,
@@ -193,9 +194,9 @@ export function TranslationPage({itemId, attachmentId, pdf, page, pageCount, sca
         }}/>) }
       </div>}
       {(rendering || checking || pending || !ready) && <div className="translation-status"><Translate className={rendering || pending ? 'spin' : ''}/>
-        <strong>{rendering || checking ? '正在读取本机译文…' : pending ? '正在翻译当前页…' : '当前页还没有译文'}</strong>
-        <p>{issue || (layout.paragraphs.length ? '译文完成后将自动保存到本机文献库。' : '此页没有可识别的文字。')}</p>
-        {!rendering && !checking && !pending && layout.paragraphs.length > 0 && <button onClick={retry}><ArrowClockwise/>重新尝试</button>}
+        <strong>{rendering || checking ? '正在读取本机译文…' : pending ? '正在翻译当前页…' : skipped ? '中文页面无需翻译' : '当前页还没有译文'}</strong>
+        <p>{issue || translation?.reason || (layout.paragraphs.length ? '译文完成后将自动保存到本机文献库。' : '此页没有可识别的文字。')}</p>
+        {!rendering && !checking && !pending && !skipped && layout.paragraphs.length > 0 && <button onClick={retry}><ArrowClockwise/>重新尝试</button>}
       </div>}
       {ready && <footer><small>中文译文 · 第 {page} / {pageCount} 页 · 已存本机{alignment?.pending ? ' · 正在定位选中文本…' : alignment?.error ? ' · ' + alignment.error : ''}</small>
         <button onClick={() => navigator.clipboard.writeText(layout.paragraphs.map(paragraph => translations[paragraph.id]).filter(Boolean).join('\n\n')).then(() => notify('本页译文已复制')).catch(fail)}><Copy/>复制译文</button>

@@ -22,12 +22,12 @@ export function AiSearchList({items, selected, disabled, onSelect, onSelectAll, 
         <td className="discovery-paper">
           <button className="discovery-paper-title" title={item.title} onClick={() => onOpen(item)}>{item.title}</button>
           <small className="discovery-authors" title={authorText(item) || ''}>{authorText(item) || '作者待补充'}</small>
-          <div className="discovery-record-flags"><span>{(item.sources || []).map((source: string) => sourceNames[source] || source).join(' / ') || '来源待核对'}</span><span>{item.abstract ? '有摘要' : '仅题名'}</span>{item.oaUrl && <span>开放链接</span>}</div>
+          <div className="discovery-record-flags"><span>{(item.sources || []).map((source: string) => sourceNames[source] || source).join(' / ') || '来源待核对'}</span><span>{item.abstract ? '有摘要' : '仅题名'}</span>{item.oaUrl && <span title="候选链接，尚未验证为 PDF">开放链接待检查</span>}</div>
         </td>
         <td className="discovery-venue">{item.venue || '来源未提供'}{item.journalMatch?.matched && <small>JCR {item.journalMatch.jcrQuartile || '—'} · IF {item.journalMatch.impactFactor ?? '—'} · {item.journalMatch.jcrYear || '年份未知'}</small>}</td>
         <td className="discovery-number">{item.citationCount ?? '—'}</td>
         <td className="discovery-number">{item.year || '—'}</td>
-        <td className="discovery-actions"><button onClick={() => onOpen(item)}>查看简介</button><button disabled={disabled} onClick={() => onSave(item.id)}>保存题录</button></td>
+        <td className="discovery-actions"><button onClick={() => onOpen(item)}>查看简介</button><button disabled={disabled} onClick={() => onSave(item.id)}>保存文献</button></td>
       </tr>)}</tbody>
     </table>
   </div>;

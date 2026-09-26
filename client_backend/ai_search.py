@@ -21,6 +21,7 @@ from xml.etree import ElementTree
 from .biblio import author_name, csl_type, normalize
 from .common import AppError, bounded_int, doi, dumps, norm, now, require, uid
 from .search_evidence import infer, validate, fragments, screen, disposition, verified_model
+from .language import chinese_bibliography
 
 
 SOURCES = ('openalex', 'crossref', 'pubmed', 'arxiv')
@@ -1100,6 +1101,8 @@ class AiSearch:
         candidate = self.evidence(candidate_id)
         source = {'title': candidate['title'], 'abstract': candidate.get('abstract') or '',
                   'keywords': candidate.get('keywords') or []}
+        if chinese_bibliography(source['title'], source['abstract']):
+            return candidate
         source_hash = hashlib.sha256(dumps(source).encode('utf-8')).hexdigest()
         cached = candidate.get('introZh') or {}
         if cached.get('sourceHash') == source_hash:

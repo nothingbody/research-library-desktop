@@ -242,6 +242,7 @@ def parse_ris(text):
                 'title': first('TI', 'T1'), 'author': [author_name(a) for a in record.get('AU', record.get('A1', []))],
                 'container-title': first('T2', 'JO', 'JF', 'JA') if first('TY') == 'CHAP' else first('JO', 'JF', 'T2', 'JA'), 'abstract': first('AB', 'N2'),
                 'DOI': first('DO'), 'URL': first('UR'), 'volume': first('VL'), 'issue': first('IS'),
+                'publisher': first('PB'), 'publisher-place': first('CY', 'PP'),
                 'page': first('SP') + (('-' + first('EP')) if first('EP') else ''),
                 'tags': record.get('KW', []), 'originalRIS': record}
         year = re.search(r'\d{4}', first('PY', 'Y1', 'DA'))
@@ -310,7 +311,7 @@ def export_records(items, fmt):
                         record[dest] = original_or_encoded(original, dest, item[src], protect_caps=src == 'title')
                 else:
                     record.pop(dest, None)
-            for key in ('journal', 'booktitle'):
+            for key in ('journal', 'journaltitle', 'booktitle'):
                 record.pop(key, None)
             if item.get('container-title'):
                 target_key = 'journal' if csl_type(item.get('type')) == 'article-journal' else 'booktitle'
@@ -341,7 +342,9 @@ def export_records(items, fmt):
             else:
                 record.pop('author', None)
             if item.get('tags'):
-                record['keywords'] = ', '.join(item['tags'])
+                record['keywords'] = bib_text(', '.join(item['tags']))
+            else:
+                record.pop('keywords', None)
             records.append(record)
         database = BibDatabase()
         database.entries = records
@@ -358,8 +361,9 @@ def export_records(items, fmt):
             for author in item.get('author', []):
                 if author.get('literal') != '等':
                     line('AU', author.get('literal') or ', '.join(filter(None, [author.get('family'), author.get('given')])))
-            for field, tag in [('container-title', 'T2' if kind == 'chapter' else 'JO'), ('DOI', 'DO'), ('URL', 'UR'), ('abstract', 'AB'), ('volume', 'VL'), ('issue', 'IS'), ('ISSN', 'SN')]:
+            for field, tag in [('container-title', 'T2' if kind == 'chapter' else 'JO'), ('DOI', 'DO'), ('URL', 'UR'), ('abstract', 'AB'), ('volume', 'VL'), ('issue', 'IS'), ('publisher', 'PB'), ('publisher-place', 'CY')]:
                 line(tag, item.get(field))
+            line('SN', item.get('ISSN') if kind == 'article-journal' else item.get('ISBN') or item.get('ISSN'))
             line('PY', year_of(item))
             pages = re.split(r'[-–]+', str(item.get('page', '')), maxsplit=1)
             line('SP', pages[0])

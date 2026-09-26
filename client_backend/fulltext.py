@@ -3,12 +3,33 @@ from __future__ import annotations
 """Resolve public full-text links and attach verified PDFs to a local item."""
 
 from html.parser import HTMLParser
+from pathlib import Path
+from dataclasses import dataclass
 import json
 import re
 from urllib import parse
 
 from .common import AppError, doi, now, require, uid
 from .netsafe import open_url, public_url
+
+
+@dataclass(frozen=True)
+class ResolvedFulltext:
+    url: str
+    kind: str
+    referer: str = ''
+    fetched: str = ''
+
+    def __iter__(self):
+        # Keep the resolver's existing two-value interface for callers.
+        yield self.url
+        yield self.kind
+
+    def __getitem__(self, index):
+        return (self.url, self.kind)[index]
+
+    def __len__(self):
+        return 2
 
 
 class PdfLinks(HTMLParser):
@@ -21,7 +42,7 @@ class PdfLinks(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         data = {key.lower(): value for key, value in attrs if key and value}
-        if tag == 'meta' and data.get('name', '').lower() == 'citation_pdf_url':
+        if tag == 'meta' and data.get('name', '').lower() in ('citation_pdf_url', 'dc.identifier.pdf'):
             self.links.append(data.get('content', ''))
         elif tag == 'link' and ('application/pdf' in data.get('type', '').lower() or
                                  'pdf' in data.get('rel', '').lower()):
@@ -43,7 +64,7 @@ class PdfLinks(HTMLParser):
         data, label = self._anchor, ' '.join(self._anchor_text)
         label += ' ' + ' '.join(data.get(key, '') for key in ('href', 'title', 'aria-label', 'download'))
         label = label.lower()
-        if re.search(r'(?:\.pdf(?:[?#]|$)|/pdf(?:/|\?|$)|/download(?:/|\?|$)|pdf\s*下载|下载\s*pdf|全文下载|download\s+pdf)', label) and not re.search(r'supplement|supporting|appendix|补充材料|参考文献', label):
+        if re.search(r'(?:\.pdf(?:[?#]|$)|/pdf(?:/|\?|$)|/download(?:/|\?|$)|pdf\s*下载|下载\s*pdf|全文下载|download\s+(?:pdf|full\s*text|article))', label) and not re.search(r'supplement|supporting|appendix|补充材料|参考文献', label):
             self.links.append(data['href'])
         self._anchor, self._anchor_text = None, []
 
@@ -90,7 +111,7 @@ class Fulltext:
             locations = [work.get('best_oa_location') or {}] + list(work.get('locations') or [])
             for location in locations:
                 if location.get('is_oa') or location == work.get('best_oa_location'):
-                    found.append(location.get('pdf_url') or location.get('landing_page_url'))
+                    found.extend((location.get('pdf_url'), location.get('landing_page_url')))
             found.append((work.get('open_access') or {}).get('oa_url'))
         except (AppError, ValueError) as exc:
             errors.append('OpenAlex：' + str(exc))
@@ -100,7 +121,7 @@ class Fulltext:
                 url = 'https://api.unpaywall.org/v2/' + parse.quote(identifier, safe='/') + '?' + parse.urlencode({'email': contact})
                 work = fetch(url)
                 for location in [work.get('best_oa_location') or {}] + list(work.get('oa_locations') or []):
-                    found.append(location.get('url_for_pdf') or location.get('url_for_landing_page'))
+                    found.extend((location.get('url_for_pdf'), location.get('url_for_landing_page')))
             except (AppError, ValueError) as exc:
                 errors.append('Unpaywall：' + str(exc))
         added = 0
@@ -132,16 +153,36 @@ class Fulltext:
     def _resolve(self, source, progress, depth=0):
         url = public_url(source['url'])
         progress(.05, '正在检查公开全文链接')
-        with open_url(url, timeout=25) as response:
+        fetched = lambda done, size: progress(.05 + .5 * (done / size if size else .3), f'正在下载 {done / 1024 ** 2:.1f} MB')
+        with open_url(url, timeout=25, browser=True, progress=fetched) as response:
             final_url = public_url(response.geturl())
             raw = response.read(2 * 1024 * 1024)
             content_type = response.headers.get('Content-Type', '').lower()
-        if b'%PDF-' in raw[:1024]:
-            return final_url, 'pdf'
+            if b'%PDF-' in raw[:1024]:
+                # The main process already has the whole file: keep it rather than download it twice.
+                kept = response.keep(self.downloads.scratch_path()) if hasattr(response, 'keep') else ''
+                return ResolvedFulltext(final_url, 'pdf', fetched=kept)
         if 'html' not in content_type and not raw.lstrip().lower().startswith((b'<!doctype html', b'<html')):
-            return '', 'unknown'
+            return ResolvedFulltext('', 'unknown')
         parser = PdfLinks()
-        parser.feed(raw.decode('utf-8', errors='replace'))
+        html = raw.decode('utf-8', errors='replace')
+        parser.feed(html)
+        # IEEE's visible PDF button opens a viewer. Its document metadata
+        # carries the direct file, but only use it for the current OA article.
+        final_parts = parse.urlsplit(final_url)
+        if final_parts.hostname == 'ieeexplore.ieee.org':
+            match = re.search(r'xplGlobal\.document\.metadata\s*=\s*', html)
+            article = re.search(r'/document/(\d+)', final_parts.path)
+            expected = article.group(1) if article else (parse.parse_qs(final_parts.query).get('arnumber') or [''])[0]
+            if match and expected:
+                try:
+                    metadata = json.JSONDecoder().raw_decode(html[match.end():])[0]
+                    path = str(metadata.get('pdfPath') or '')
+                    if metadata.get('isOpenAccess') is True and str(metadata.get('articleNumber')) == expected and re.fullmatch(r'/iel\d+/\d+/\d+/' + re.escape(expected) + r'\.pdf', path):
+                        parser.links.insert(0, path)
+                        parser.links.insert(0, '/stampPDF/getPDF.jsp?tp=&isnumber=&arnumber=' + expected)
+                except (ValueError, AttributeError, TypeError):
+                    pass
         if not parser.links and parser.refresh and depth < 2:
             return self._resolve({'url': public_url(parse.urljoin(final_url, parser.refresh))}, progress, depth + 1)
         item_doi = ''
@@ -155,34 +196,59 @@ class Fulltext:
                 embedded = re.search(r'10\.\d{4,9}/[^?#]+', decoded)
                 if item_doi and embedded and item_doi.lower() not in decoded:
                     continue
-                return candidate, 'pdf'
+                return ResolvedFulltext(candidate, 'pdf', referer=final_url)
             except AppError:
                 continue
-        return final_url, 'landing'
+        return ResolvedFulltext(final_url, 'landing')
+
+    def _obtain_any(self, item_id, progress):
+        """Try the known sources, then every other OA copy OpenAlex/Unpaywall list,
+        then the original record page. A publisher that refuses scripts (HTTP 403)
+        often has the same paper in a repository (PMC, arXiv, institutional
+        archives) that serves the PDF; the record page's citation_pdf_url is last."""
+        tried, refused, failures, reached = set(), set(), [], [0.0]
+
+        def report(step, host, amount, message):
+            reached[0] = max(reached[0], min(.95, (step + amount) / (step + 2)))
+            progress(reached[0], f'{host}：{message}')
+
+        step = 0
+        for stage in ('known', 'discovered', 'record'):
+            if stage == 'discovered':
+                progress(reached[0], '正在查找其他开放获取副本')
+                try:
+                    self.discover(item_id)
+                except AppError as exc:
+                    failures.append(str(exc))
+            for row in self.sources(item_id):
+                if row['id'] in tried or (row['origin'] == 'record') != (stage == 'record'):
+                    continue
+                tried.add(row['id'])
+                host = (parse.urlsplit(row['url']).hostname or '').lower()
+                if host in refused:
+                    self._mark(row['id'], f'{host} 已拒绝程序下载（HTTP 403），跳过该站点的其他链接')
+                    continue
+                try:
+                    return self.obtain({'itemId': item_id, 'sourceId': row['id']},
+                                       lambda amount, message, s=step, h=host: report(s, h, amount, message))
+                except AppError as exc:
+                    failures.append(str(exc) if host in str(exc) else f'{host}：{exc}')
+                    if exc.code in ('FULLTEXT_FORBIDDEN', 'FULLTEXT_CHALLENGE'):
+                        refused.update(filter(None, (host, (exc.details or {}).get('host'))))
+                except Exception as exc:
+                    failures.append(f'{host}：{type(exc).__name__}')
+                step += 1
+        require(tried, '没有可用的全文来源；请添加 PDF 地址或用浏览器下载')
+        raise AppError('FULLTEXT_UNAVAILABLE', '所有全文来源均未取得 PDF：' + '；'.join(failures[:3]))
+
+    def _mark(self, source_id, error):
+        with self.library.db(True) as db:
+            db.execute('UPDATE fulltext_sources SET state=?,error=?,updated_at=? WHERE id=?', ('failed', error[:500], now(), source_id))
 
     def obtain(self, payload, progress):
         require(self.library.get_settings().get('online', True), '联网已关闭')
         if not payload.get('sourceId'):
-            item_id = payload.get('itemId')
-            sources = self.sources(item_id)
-            if not any(row['origin'] == 'oa' for row in sources):
-                try:
-                    self.discover(item_id)
-                except AppError:
-                    pass
-                sources = self.sources(item_id)
-            sources = [row for row in sources if row['origin'] != 'record']
-            require(sources, '没有可用的全文来源；请添加 PDF 地址或用浏览器下载')
-            failures = []
-            for index, candidate in enumerate(sources):
-                try:
-                    return self.obtain({'itemId': item_id, 'sourceId': candidate['id']},
-                                       lambda amount, message: progress((index + amount) / len(sources), message))
-                except AppError as exc:
-                    failures.append(str(exc))
-                except Exception as exc:
-                    failures.append(f'{parse.urlsplit(candidate["url"]).hostname}：{type(exc).__name__}')
-            raise AppError('FULLTEXT_UNAVAILABLE', '所有全文来源均未取得 PDF：' + '；'.join(failures[:3]))
+            return self._obtain_any(payload.get('itemId'), progress)
         source = self._source(payload)
         if source['attachment_id']:
             with self.library.db() as db:
@@ -191,9 +257,11 @@ class Fulltext:
                     return {'sourceId': source['id'], 'attachmentId': source['attachment_id'], 'duplicate': True}
         with self.library.db(True) as db:
             db.execute("UPDATE fulltext_sources SET state='checking',error='',updated_at=? WHERE id=?", (now(), source['id']))
-        kind = ''
+        kind, fetched = '', ''
         try:
-            resolved, kind = self._resolve(source, progress)
+            resolution = self._resolve(source, progress)
+            resolved, kind = resolution
+            referer, fetched = getattr(resolution, 'referer', ''), getattr(resolution, 'fetched', '')
             with self.library.db(True) as db:
                 db.execute('''UPDATE fulltext_sources SET resolved_url=?,kind=?,state=?,checked_at=?,updated_at=? WHERE id=?''',
                            (resolved, kind, 'ready' if kind == 'pdf' else 'landing' if kind == 'landing' else 'failed', now(), now(), source['id']))
@@ -202,14 +270,20 @@ class Fulltext:
             progress(.2, '已确认 PDF 地址，正在下载')
             with self.library.db(True) as db:
                 db.execute("UPDATE fulltext_sources SET state='downloading',updated_at=? WHERE id=?", (now(), source['id']))
-            result = self.downloads.pdf({'itemId': source['item_id'], 'url': resolved},
-                                        lambda amount, message: progress(.2 + .75 * amount, message))
+            if fetched:
+                progress(.6, '已取得 PDF，正在校验')
+                result, fetched = self.downloads.attach_file(source['item_id'], fetched, resolved), ''
+            else:
+                result = self.downloads.pdf({'itemId': source['item_id'], 'url': resolved, 'referer': referer},
+                                            lambda amount, message: progress(.2 + .75 * amount, message))
             with self.library.db(True) as db:
                 db.execute("UPDATE fulltext_sources SET state='attached',attachment_id=?,error='',updated_at=? WHERE id=?",
                            (result['attachmentId'], now(), source['id']))
             progress(.99, 'PDF 已挂接，正在后台建立全文索引')
             return {'sourceId': source['id'], 'attachmentId': result['attachmentId'], 'duplicate': False}
         except Exception as exc:
+            if fetched:
+                Path(fetched).unlink(missing_ok=True)
             with self.library.db(True) as db:
                 db.execute('UPDATE fulltext_sources SET state=?,error=?,updated_at=? WHERE id=?',
                            ('landing' if isinstance(exc, AppError) and exc.code == 'FULLTEXT_NOT_PDF' and kind == 'landing' else 'failed',

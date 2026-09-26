@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
@@ -26,7 +27,9 @@ class Attachments:
         require(path.stat().st_size <= 2 * 1024 ** 3, '附件超过2GB')
         digest = sha256(path)
         size = path.stat().st_size
-        mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+        with path.open('rb') as stream:
+            pdf_header = b'%PDF-' in stream.read(1024)
+        mime = 'application/pdf' if pdf_header else (mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
         if role is None:
             role = 'supplementary' if re.search(r'(supplement(?:ary|al)?|supporting|appendix|(?:^|[_ .-])si(?:[_ .-]|$))', path.stem, re.I) else ('main' if mime == 'application/pdf' else 'other')
         require(role in ('main', 'supplementary', 'other'), '附件类型不正确')
@@ -99,6 +102,62 @@ class Attachments:
             require(row, '附件不存在')
             db.execute('UPDATE attachments SET role=? WHERE id=?', (role, attachment_id))
         return {'id': attachment_id, 'role': role}
+
+    def convert_caj(self, attachment_id, progress=lambda *args: None, jobs=None):
+        """Normalize KDH-backed CAJ into a readable PDF, retaining the original."""
+        record = self.record(attachment_id)
+        require(Path(record['name']).suffix.casefold() == '.caj', '请选择 CAJ 原件')
+        source = self.path(attachment_id, verify=True)
+        require(source.stat().st_size <= 512 * 1024 * 1024, 'CAJ 超过 512 MB，暂不能自动转换')
+        with source.open('rb') as stream:
+            signature = stream.read(254)
+        require(signature.startswith(b'KDH '), '此 CAJ 的内部格式暂不支持自动转换；原件仍已保存，可用 CAJ 阅读器打开')
+        key = b'FZHMEI'
+        download_dir = self.library.root / 'downloads'
+        download_dir.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='caj-', dir=download_dir) as temporary:
+            work = Path(temporary)
+            decoded = work / 'decoded.pdf'
+            progress(.05, '正在解码 KDH 全文')
+            with source.open('rb') as input_file, decoded.open('wb') as output_file:
+                input_file.seek(254)
+                offset = 0
+                while block := input_file.read(1024 * 1024):
+                    output_file.write(bytes(value ^ key[(offset + index) % len(key)] for index, value in enumerate(block)))
+                    offset += len(block)
+                    progress(.05 + .35 * input_file.tell() / source.stat().st_size, '正在解码 KDH 全文')
+            with decoded.open('r+b') as output_file:
+                require(output_file.read(8).startswith(b'%PDF-'), 'CAJ 内容不能还原为 PDF，原件仍已保存')
+                size = output_file.seek(0, os.SEEK_END)
+                output_file.seek(max(0, size - 1024 * 1024))
+                tail_offset = output_file.tell()
+                eof = output_file.read().rfind(b'%%EOF')
+                require(eof >= 0, 'CAJ 中没有完整的 PDF 结束标记，原件仍已保存')
+                output_file.truncate(tail_offset + eof + 5)
+            progress(.45, '正在修复 PDF 页面结构')
+            try:
+                reader = PdfReader(decoded, strict=False)
+                page_count = len(reader.pages)
+                require(page_count > 0, 'CAJ 中没有可阅读的页面')
+                writer = PdfWriter()
+                writer.append_pages_from_reader(reader)
+                converted = work / (Path(record['name']).stem + '.pdf')
+                with converted.open('wb') as output_file:
+                    writer.write(output_file)
+                verified = PdfReader(converted, strict=True)
+                require(len(verified.pages) == page_count, 'PDF 页面校验失败，CAJ 原件仍已保存')
+            except AppError:
+                raise
+            except Exception as exc:
+                raise AppError('CAJ_CONVERSION_FAILED', 'CAJ 转换失败，原件仍已保存；可使用 CAJ 阅读器打开') from exc
+            progress(.85, '正在将 PDF 加入文献库')
+            added = self.add(record['item_id'], converted, mode='managed', role='main')
+        if jobs:
+            current = self.record(added['id'])
+            if current['text_status'] in ('pending', 'error'):
+                jobs.create('pdf.index', {'attachmentId': added['id']})
+        progress(.99, 'PDF 已保存，正在建立全文索引')
+        return {'attachmentId': added['id'], 'pageCount': page_count, 'duplicate': added['duplicate']}
 
     def index(self, attachment_id, progress=lambda *args: None):
         record = self.record(attachment_id)

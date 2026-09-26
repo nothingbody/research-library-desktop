@@ -2,12 +2,20 @@
 <header><span class="brand">文献工作台</span><h1>保存当前文献</h1><p>核对题录后，保存到本机文献库。</p></header>
 <main>
   <section id="connection" hidden><p>请保持文献工作台桌面端运行，扩展会自动连接本机文献库。</p><button id="retry" type="button">重试连接</button></section>
+  <section id="batch" hidden>
+    <p id="batch-summary"></p>
+    <div id="batch-items" class="batch-items"></div>
+    <label>保存到<select id="batch-collection"><option value="">我的文献</option></select></label>
+    <button id="batch-save" class="primary" type="button">保存所选文献</button>
+    <small>保存时自动检查重复条目；知网结果会逐篇补全详情摘要。最多处理当前页前 50 条。</small>
+  </section>
   <section id="record" hidden>
     <label>文献类型<select id="type"><option value="article-journal">期刊论文</option><option value="paper-conference">会议论文</option><option value="thesis">学位论文</option><option value="book">图书</option><option value="webpage">网页</option><option value="document">其他文献</option></select></label>
     <label>题名 <span class="required">*</span><textarea id="title" rows="2"></textarea></label>
     <label>作者 <small>以分号分隔</small><input id="authors" placeholder="例如 Zhang, Wei; Li, Ming"></label>
     <div class="row"><label>年份<input id="year" inputmode="numeric" maxlength="4"></label><label>DOI<input id="doi"></label></div>
     <label>期刊 / 会议<input id="venue"></label>
+    <div id="book-fields" class="row" hidden><label>出版社<input id="publisher"></label><label>ISBN<input id="isbn"></label></div>
     <label>摘要<textarea id="abstract" rows="3"></textarea></label>
     <p id="classification" class="classification" hidden></p>
     <label>保存到<select id="collection"><option value="">我的文献</option></select></label>

@@ -7,6 +7,7 @@ const {Readable} = require('node:stream');
 const mainLog = require('./main-log.cjs');
 const {startOfficeBridge, PORT: OFFICE_BRIDGE_PORT} = require('./office-bridge.cjs');
 const {createStyleCatalog} = require('./csl-catalog.cjs');
+const {createFulltextFetcher, createHostHandler} = require('./fulltext-fetch.cjs');
 const {Cite, plugins} = require('@citation-js/core');
 require('@citation-js/plugin-csl');
 require('@citation-js/plugin-bibtex');
@@ -21,7 +22,31 @@ const launcherScheme = 'researchlibrary';
 mainLog.install(app.getPath('userData'), {captureConsole: true});
 let win, child, closing = false, sequence = 0, readyPromise, root, configPath, config = {}, officeBridge, styleCatalog;
 const pending = new Map();
-const allowed = new Set(('app.info library.stats library.reindex items.list items.get items.create items.update items.bulk items.deletePermanently items.duplicates items.latestMerge items.merge items.undoMerge collections.list collections.edit notes.list notes.save notes.history notes.delete attachments.get attachments.position attachments.download attachments.setRole annotations.list annotations.save annotations.delete annotations.excerpt annotations.search annotations.exportText reading.get reading.save reading.activity terms.list terms.save terms.delete assistant.status assistant.settings assistant.test assistant.run assistant.runs assistant.translation.page assistant.apply aiSearch.create aiSearch.list aiSearch.get aiSearch.savePlan aiSearch.run aiSearch.expand aiSearch.citationExpand aiSearch.citationLinks aiSearch.rerank aiSearch.journalMatch aiSearch.results aiSearch.evidence aiSearch.intro aiSearch.import aiSearch.cancel aiSearch.verify aiSearch.decision searchEvaluation.report searchEvaluation.save relations.profile.get relations.profile.run relations.create relations.list relations.get relations.diff relations.history relations.run relations.results relations.evidence relations.confirm relations.export relations.forItem relations.discover relations.discoveries relations.discoveryProgress relations.discoveryDecide relations.manualList relations.manualAdd relations.graphExport imports.commit jobs.list jobs.action journals.stats journals.list journals.get journals.catalog journals.link journals.related journals.ensure journals.index collector.control settings.get settings.save browser.status browser.importDownloaded writing.sessions writing.session writing.session.save writing.event comparison.list comparison.save metadata.lookup metadata.apply export.text fulltext.sources fulltext.add fulltext.obtain researchAsk.create researchAsk.list researchAsk.get researchAsk.send researchAsk.saveClaim projects.create projects.list projects.get projects.archive projects.link smartCollections.save smartCollections.list smartCollections.results').split(' '));
+let fulltextFetcher = null;
+const hostHandler = createHostHandler(
+  () => fulltextFetcher || (fulltextFetcher = createFulltextFetcher({log: (tag, message) => mainLog.write('fulltext ' + tag, message)})),
+  message => {
+    if (!child || child.exitCode !== null || !child.stdin.writable) return;
+    child.stdin.write(JSON.stringify(message) + '\n', error => {if (error) mainLog.write('backend pipe', error);});
+  });
+function ensureBrowserExtension() {
+  const source = app.isPackaged ? path.join(process.resourcesPath, 'browser-extension') : path.join(__dirname, 'browser-extension');
+  const destination = path.join(app.getPath('userData'), 'browser-extension');
+  if (!fs.existsSync(path.join(source, 'manifest.json'))) throw new Error('浏览器扩展文件缺失，请重新安装文献工作台');
+  fs.mkdirSync(destination, {recursive: true});
+  // Chrome retains the unpacked-extension path when the application is replaced.
+  for (const name of ['background.js', 'popup.css', 'popup.html', 'popup.js', 'manifest.json']) {
+    const input = path.join(source, name), output = path.join(destination, name);
+    const contents = fs.readFileSync(input);
+    if (!fs.existsSync(output) || !fs.readFileSync(output).equals(contents)) {
+      const temporary = output + '.tmp';
+      fs.writeFileSync(temporary, contents);
+      fs.renameSync(temporary, output);
+    }
+  }
+  return destination;
+}
+const allowed = new Set(('app.info library.stats library.reindex items.list items.get items.create items.update items.bulk items.deletePermanently items.duplicates items.latestMerge items.merge items.undoMerge collections.list collections.edit notes.list notes.save notes.history notes.delete attachments.get attachments.position attachments.download attachments.setRole attachments.convertCaj annotations.list annotations.save annotations.delete annotations.excerpt annotations.search annotations.exportText reading.get reading.save reading.activity terms.list terms.save terms.delete assistant.status assistant.settings assistant.test assistant.run assistant.runs assistant.translation.page assistant.apply aiSearch.create aiSearch.list aiSearch.get aiSearch.savePlan aiSearch.run aiSearch.expand aiSearch.citationExpand aiSearch.citationLinks aiSearch.rerank aiSearch.journalMatch aiSearch.results aiSearch.evidence aiSearch.intro aiSearch.import aiSearch.cancel aiSearch.verify aiSearch.decision searchEvaluation.report searchEvaluation.save relations.profile.get relations.profile.run relations.create relations.list relations.get relations.diff relations.history relations.run relations.results relations.evidence relations.confirm relations.export relations.forItem relations.discover relations.discoveries relations.discoveryProgress relations.discoveryDecide relations.manualList relations.manualAdd relations.manualRemove relations.graphExport imports.commit jobs.list jobs.action journals.stats journals.list journals.get journals.catalog journals.link journals.related journals.ensure journals.index collector.control settings.get settings.save browser.status browser.importDownloaded writing.sessions writing.session writing.session.save writing.event comparison.list comparison.save metadata.lookup metadata.apply export.text fulltext.sources fulltext.add fulltext.obtain fulltext.discover researchAsk.create researchAsk.list researchAsk.get researchAsk.send researchAsk.saveClaim projects.create projects.list projects.get projects.archive projects.link smartCollections.save smartCollections.list smartCollections.results').split(' '));
 
 function focusWindow() {
   if (!win || win.isDestroyed()) return;
@@ -76,7 +101,7 @@ function rpc(method, params = {}) {
 function startBackend() {
   const executable = app.isPackaged ? path.join(process.resourcesPath, 'backend/research-backend.exe') : path.join(project, '.venv-client/Scripts/python.exe');
   const args = app.isPackaged ? [] : ['-X', 'utf8', '-m', 'client_backend.service'];
-  args.push('--library', root);
+  args.push('--library', root, '--host-bridge');
   const journals = process.env.RESEARCH_JOURNALS || path.join(project, 'data/scholay');
   if (fs.existsSync(path.join(journals, 'journals.sqlite3'))) args.push('--journals', journals);
   let resolveReady, rejectReady;
@@ -90,6 +115,7 @@ function startBackend() {
   readline.createInterface({input: child.stdout}).on('line', line => {
     let message;
     try {message = JSON.parse(line);} catch {return;}
+    if (message.host) {void hostHandler(message.host); return;}
     if (message.event === 'ready') resolveReady();
     if (message.event && win && !win.isDestroyed()) win.webContents.send('backend-event', message.event, message.data);
     const task = pending.get(message.id);
@@ -118,7 +144,7 @@ async function chooseDirectory(title) {
   const result = await dialog.showOpenDialog(win, {title, properties: ['openDirectory', 'createDirectory']});
   return result.canceled ? null : result.filePaths[0];
 }
-const filters = [{name: '文献与 PDF', extensions: ['pdf', 'ris', 'bib', 'bibtex', 'json']}, {name: '所有文件', extensions: ['*']}];
+const filters = [{name: '文献、PDF 与 CAJ', extensions: ['pdf', 'caj', 'ris', 'bib', 'bibtex', 'json']}, {name: '所有文件', extensions: ['*']}];
 async function fileAction(kind, p) {
   if (kind === 'citationStyle') {
     const picked = await dialog.showOpenDialog(win, {title:'导入独立 CSL 样式',properties:['openFile'],filters:[{name:'CSL 样式',extensions:['csl']}]});
@@ -150,8 +176,19 @@ async function fileAction(kind, p) {
   }
   if (kind === 'openAttachment') {
     const value = await rpc('_attachments.path', {id: p.id});
-    if (!/\.(pdf|txt|md|png|jpe?g|gif|csv|docx?|xlsx?|pptx?)$/i.test(value.name)) throw new Error('此文件类型请使用“显示所在位置”后手动打开');
-    return shell.openPath(value.path);
+    if (!/\.(pdf|caj|txt|md|png|jpe?g|gif|csv|docx?|xlsx?|pptx?)$/i.test(value.name)) throw new Error('此文件类型请使用“显示所在位置”后手动打开');
+    let openPath = value.path;
+    if (path.extname(openPath).toLowerCase() !== path.extname(value.name).toLowerCase()) {
+      // Managed attachments use a hash-only object path. Give the external
+      // reader a temporary copy with its real extension for file association.
+      const directory = path.join(app.getPath('temp'), 'research-library-open', p.id);
+      fs.mkdirSync(directory, {recursive: true});
+      openPath = path.join(directory, path.basename(value.name));
+      fs.copyFileSync(value.path, openPath);
+    }
+    const error = await shell.openPath(openPath);
+    if (error) throw new Error(/\.caj$/i.test(value.name) ? 'CAJ 已保存，但系统未能打开原件。请安装支持 CAJ 的阅读器，或为这篇文献添加 PDF 附件。' : `系统无法打开附件：${error}`);
+    return true;
   }
   if (kind === 'revealAttachment') {const value = await rpc('_attachments.path', {id: p.id}); shell.showItemInFolder(value.path); return true;}
   if (kind === 'export' || kind === 'annotatedPDF' || kind === 'noteExport' || kind === 'annotationExport' || kind === 'graphExport' || kind === 'graphImageExport') {
@@ -185,7 +222,7 @@ async function fileAction(kind, p) {
     config.libraryRoot = directory; saveConfig(); delete process.env.RESEARCH_LIBRARY; app.relaunch(); app.quit(); return true;
   }
   if (kind === 'revealLibrary') {await shell.openPath(root); return true;}
-  if (kind === 'revealBrowserExtension') {await shell.openPath(app.isPackaged ? path.join(process.resourcesPath, 'browser-extension') : path.join(__dirname, 'browser-extension')); return true;}
+  if (kind === 'revealBrowserExtension') {const directory = ensureBrowserExtension(); const error = await shell.openPath(directory); if (error) throw new Error(`无法打开扩展目录：${error}`); return {path: directory};}
   throw new Error('文件操作不支持');
 }
 async function serve(request) {
@@ -223,6 +260,7 @@ async function serve(request) {
 
 async function init() {
   fs.mkdirSync(app.getPath('userData'), {recursive: true});
+  ensureBrowserExtension();
   configPath = path.join(app.getPath('userData'), 'library-config.json');
   try {config = JSON.parse(fs.readFileSync(configPath, 'utf8'));} catch {}
   root = process.env.RESEARCH_LIBRARY || config.libraryRoot || (app.isPackaged ? path.join(app.getPath('documents'), '文献工作台') : path.join(project, 'library'));

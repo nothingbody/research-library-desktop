@@ -10,6 +10,7 @@ from .common import AppError, dumps, now, require, uid
 # Lower runs first. Interactive kinds a user is actively waiting on jump ahead of
 # batch work such as imports, indexing and backups.
 PRIORITIES = {
+    'caj.convert': 10,
     'metadata.lookup': 10, 'fulltext.obtain': 10, 'pdf.download': 10,
     'assistant.run': 10, 'research-ask.run': 10, 'ai-search.verify': 10, 'ai-search.rerank': 10,
     'ai-search.run': 20, 'ai-search.expand': 20, 'ai-search.citations': 20,

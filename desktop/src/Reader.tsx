@@ -9,7 +9,8 @@ import {ReadingAssistant} from './ReadingAssistant';
 import {ContinuousPage} from './ContinuousPage';
 import {BilingualContinuousPage} from './BilingualContinuousPage';
 import {TranslationPage} from './TranslationPage';
-import {normalizePdfLineSelection} from './pdfTextSelection';
+import {attachSelectionGuard, mergeSelectionRects, normalizePdfLineSelection, trackPdfSelectionDrag} from './pdfTextSelection';
+import {classifyDocumentLanguage, type DocumentLanguage} from './documentLanguage';
 import './readerOcr.css';
 import './readerSelection.css';
 GlobalWorkerOptions.workerSrc = workerUrl;
@@ -33,7 +34,8 @@ function Thumbnail({pdf, page, active, click}: {pdf: PDFDocumentProxy; page: num
 export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, fail, onNote, onResearchAsk}: {attachmentId: string; jumpPage?: number; jumpAnnotation?: string; stamp?: number; notify: (message: string) => void; fail: (e: any) => void; onNote: () => void; onResearchAsk: (itemId: string, question: string) => void}) {
   const [record, setRecord] = useState<Data | null>(null), [pdf, setPdf] = useState<PDFDocumentProxy | null>(null), [page, setPage] = useState(1), [scale, setScale] = useState(1), [rotation, setRotation] = useState(0);
   const [mode,setMode]=useState<'single'|'continuous'>('continuous');
-  const [bilingual, setBilingual] = useState(true);
+  const [bilingual, setBilingual] = useState(false);
+  const [documentLanguage, setDocumentLanguage] = useState<DocumentLanguage>('unknown');
   const [navCollapsed,setNavCollapsed] = useState(false), [annotationsCollapsed,setAnnotationsCollapsed] = useState(false), [rightPanel, setRightPanel] = useState('annotations');
   const [error, setError] = useState(''), [loading, setLoading] = useState(true), [rendering, setRendering] = useState(false), [annotations, setAnnotations] = useState<Data[]>([]), [outline, setOutline] = useState<any[]>([]), [left, setLeft] = useState('thumb');
   const [tool, setTool] = useState('select'), [color, setColor] = useState('#f6d766'), [viewport, setViewport] = useState<any>(null), [active, setActive] = useState<Data | null>(null), [comment, setComment] = useState('');
@@ -44,6 +46,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
   const readerBody = useRef<HTMLDivElement>(null), selectionActions = useRef<HTMLDivElement>(null);
   const wheelAmount = useRef(0), wheelDirection = useRef(0), wheelTime = useRef(0), pendingWheelPosition = useRef<'top' | 'bottom' | null>(null);
   const selectionStart = useRef<{x: number; y: number} | null>(null);
+  const captureRef = useRef<(event: {clientX: number; clientY: number}) => void>(() => {});
   const wheelScale = useRef(scale);
   useEffect(() => {wheelScale.current = scale;}, [scale]);
   const zoomAnchor = useRef<{element: HTMLElement; x: number; y: number; clientX: number; clientY: number; width: number; oldScale: number; scale: number} | null>(null);
@@ -133,6 +136,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
   useEffect(() => {
     let cancelled = false, task: any;
     setLoading(true); setError('');
+    setBilingual(false); setDocumentLanguage('unknown');
     Promise.all([api('attachments.get', {id: attachmentId}), api('annotations.list', {attachmentId})]).then(async ([info, ann]) => {
       if (cancelled) return;
       setRecord(info); setAnnotations(ann);
@@ -142,6 +146,17 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
       task.onPassword = (callback: (value: string) => void, reason: number) => {if (!cancelled) setPassword({callback, reason});};
       const document = await task.promise;
       if (cancelled) return;
+      let sample = '';
+      for (let number = 1; number <= Math.min(3, document.numPages); number++) {
+        try {
+          const content = await (await document.getPage(number)).getTextContent();
+          sample += ' ' + content.items.map((part: any) => String(part.str || '')).join(' ');
+        } catch { /* A damaged page must not prevent opening the rest of the PDF. */ }
+      }
+      if (cancelled) return;
+      const language = classifyDocumentLanguage(sample, info.name || '');
+      setDocumentLanguage(language);
+      setBilingual(language === 'other');
       setPdf(document); setOutline(await document.getOutline() || []); setLoading(false);
     }).catch(e => {if (!cancelled) {setError(useErrorText(e)); setLoading(false);}});
     return () => {cancelled = true; searchRun.current++; task?.destroy();};
@@ -200,7 +215,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
   useEffect(()=>{if(jumpAnnotation){const a=annotations.find(v=>v.id===jumpAnnotation);if(a){setActive(a);setComment(a.comment||'');setPage(a.pageIndex+1);setAnnotationsCollapsed(false);}}},[jumpAnnotation,stamp,annotations]);
   useEffect(() => {
     if (!pdf || !canvas.current || !text.current) return;
-    let cancelled = false, renderTask: any, textLayer: any;
+    let cancelled = false, renderTask: any, textLayer: any, detachGuard: (() => void) | undefined;
     setRendering(true); setSelection(null); setArea(null);
     const num = Math.max(1, Math.min(pdf.numPages, page));
     if (num !== page) setPage(num);
@@ -219,11 +234,12 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
       textLayer = new TextLayer({textContentSource: await p.getTextContent(), container: text.current, viewport: vp});
       await Promise.all([renderTask.promise, textLayer.render()]);
       if (!cancelled) {
+        detachGuard = attachSelectionGuard(text.current);
         setRendering(false);
         if (search) for (const el of text.current.querySelectorAll('span')) if (el.textContent?.toLowerCase().includes(search.toLowerCase())) el.classList.add('search-hit');
       }
     }).catch(e => {if (!cancelled && e.name !== 'RenderingCancelledException' && e.name !== 'AbortException') {setError(useErrorText(e)); setRendering(false);}});
-    return () => {cancelled = true; renderTask?.cancel(); textLayer?.cancel();};
+    return () => {cancelled = true; renderTask?.cancel(); textLayer?.cancel(); detachGuard?.();};
   }, [pdf, page, scale, rotation, search, loading, mode]);
   useEffect(() => {
     if (!pdf) return;
@@ -270,7 +286,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
     setSelection(value); setPage(value.page);
     if (tool === 'area' || tool === 'highlight' || tool === 'underline') addAnnotation(tool, value);
   }
-  function captureSelection(event: ReactMouseEvent<HTMLDivElement>) {
+  function captureSelection(event: {clientX: number; clientY: number}) {
     if (tool === 'area' || !paper.current || !viewport) return;
     const selected = window.getSelection();
     if (!selected || selected.isCollapsed || !selected.rangeCount || !text.current) {setSelection(null); return;}
@@ -279,7 +295,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
     if (!text.current.contains(selected.anchorNode) || !text.current.contains(selected.focusNode)) {setSelection(null); return;}
     const bounds = paper.current.getBoundingClientRect();
     const viewportRects: number[][] = [];
-    const rectangles = [...selected.getRangeAt(0).getClientRects()].filter(r => r.width > 1 && r.height > 1).map(r => {
+    const rectangles = mergeSelectionRects(selected.getRangeAt(0).getClientRects()).map(r => {
       viewportRects.push([r.left - bounds.left, r.top - bounds.top, r.right - bounds.left, r.bottom - bounds.top]);
       const a = viewport.convertToPdfPoint(r.left - bounds.left, r.top - bounds.top), b = viewport.convertToPdfPoint(r.right - bounds.left, r.bottom - bounds.top);
       return [a[0], a[1], b[0], b[1]];
@@ -288,6 +304,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
     setSelection(captured);
     if (tool === 'highlight' || tool === 'underline') addAnnotation(tool, captured);
   }
+  captureRef.current = captureSelection;
   async function find() {
     if (!pdf || !search.trim()) return;
     const run = ++searchRun.current; setSearching(true); setMatches([]); const found: Data[] = [];
@@ -301,7 +318,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
   async function destination(dest: any) {try {if (!pdf) return; const array = typeof dest === 'string' ? await pdf.getDestination(dest) : dest; if (array) goPage(typeof array[0] === 'number' ? array[0] + 1 : (await pdf.getPageIndex(array[0])) + 1);} catch(e) {fail(e);}}
   const outlineNodes = (nodes: any[], depth = 0): any => nodes.map((n, i) => <div key={i}><button className="outline-item" style={{paddingLeft: 12 + depth * 12}} onClick={() => destination(n.dest)}>{n.title}</button>{outlineNodes(n.items || [], depth + 1)}</div>);
   const renderRect = (r: number[]) => {if (!viewport) return {}; const a = viewport.convertToViewportPoint(r[0], r[1]), b = viewport.convertToViewportPoint(r[2], r[3]); return {left: Math.min(a[0], b[0]), top: Math.min(a[1], b[1]), width: Math.abs(a[0] - b[0]), height: Math.abs(a[1] - b[1])};};
-  return <div className="reader" ref={readerRoot}><div className="reader-toolbar"><button className="icon" aria-label={navCollapsed ? "展开页面缩略图和目录" : "收起页面缩略图和目录"} aria-expanded={!navCollapsed} title={navCollapsed ? "展开页面缩略图和目录" : "收起页面缩略图和目录"} onClick={()=>setNavCollapsed(v=>!v)}><List/></button><button className="icon" aria-label="上一页" disabled={page <= 1} onClick={() => goPage(page - 1)}><CaretLeft/></button><input aria-label="PDF 页码" type="number" min="1" max={pdf?.numPages || 1} value={page} onChange={e => goPage(Math.max(1, Math.min(pdf?.numPages || 1, Number(e.target.value) || 1)))}/><span>/ {pdf?.numPages || '—'}</span><button className="icon" aria-label="下一页" disabled={!pdf || page >= pdf.numPages} onClick={() => goPage(page + 1)}><CaretRight/></button><i className="separator"/><button className="icon" aria-label="缩小" onClick={() => setScale(s => Math.max(.25, s - .15))}><Minus/></button><button aria-label="重置 PDF 缩放至 100%" title="点击重置为 100%；按住 Ctrl 滚动鼠标滚轮缩放 PDF" onClick={() => setScale(1)}>{Math.round(scale * 100)}%</button><button className="icon" aria-label="放大" onClick={() => setScale(s => Math.min(4, s + .15))}><Plus/></button><button className="icon" aria-label="旋转页面" onClick={() => setRotation(r => (r + 90) % 360)}><ArrowClockwise/></button><i className="separator"/><button className={bilingual ? 'active' : ''} aria-label="切换原文译文对照" title="原文译文对照" onClick={()=>setBilingual(value=>!value)}><Translate/>对照翻译</button><button aria-label="切换连续阅读" onClick={()=>setMode(value=>value==='single'?'continuous':'single')}>{mode==='single'?'连续阅读':'单页阅读'}</button>{[['select', Cursor, '选择文字'], ['highlight', Highlighter, '高亮'], ['underline', TextUnderline, '下划线'], ['area', Selection, '区域批注']].map(([key, Icon, label]: any) => <button className={'icon ' + (tool === key ? 'active' : '')} title={label} aria-label={label} key={key} onMouseDown={e => e.preventDefault()} onClick={() => {setTool(key); if (selection && (key === 'highlight' || key === 'underline')) addAnnotation(key);}}><Icon/></button>)}<input className="color-input" aria-label="批注颜色" type="color" value={color} onChange={e => setColor(e.target.value)}/><span className="spacer"/><button className={'icon ' + (rightPanel === 'assistant' ? 'active' : '')} aria-label="打开辅助阅读" title="辅助阅读" onClick={() => {setBilingual(false); setRightPanel('assistant'); setAnnotationsCollapsed(false);}}><Sparkle/></button><button className="icon" aria-label="收起或展开批注侧栏" onClick={()=>{setBilingual(false); setRightPanel('annotations'); setAnnotationsCollapsed(v=>!v);}}><Notebook/></button><button onClick={() => files('annotatedPDF', {id: attachmentId}).then(r => r && notify('已导出带批注的 PDF 副本')).catch(fail)}><DownloadSimple/>导出批注</button></div>
+  return <div className="reader" ref={readerRoot}><div className="reader-toolbar"><button className="icon" aria-label={navCollapsed ? "展开页面缩略图和目录" : "收起页面缩略图和目录"} aria-expanded={!navCollapsed} title={navCollapsed ? "展开页面缩略图和目录" : "收起页面缩略图和目录"} onClick={()=>setNavCollapsed(v=>!v)}><List/></button><button className="icon" aria-label="上一页" disabled={page <= 1} onClick={() => goPage(page - 1)}><CaretLeft/></button><input aria-label="PDF 页码" type="number" min="1" max={pdf?.numPages || 1} value={page} onChange={e => goPage(Math.max(1, Math.min(pdf?.numPages || 1, Number(e.target.value) || 1)))}/><span>/ {pdf?.numPages || '—'}</span><button className="icon" aria-label="下一页" disabled={!pdf || page >= pdf.numPages} onClick={() => goPage(page + 1)}><CaretRight/></button><i className="separator"/><button className="icon" aria-label="缩小" onClick={() => setScale(s => Math.max(.25, s - .15))}><Minus/></button><button aria-label="重置 PDF 缩放至 100%" title="点击重置为 100%；按住 Ctrl 滚动鼠标滚轮缩放 PDF" onClick={() => setScale(1)}>{Math.round(scale * 100)}%</button><button className="icon" aria-label="放大" onClick={() => setScale(s => Math.min(4, s + .15))}><Plus/></button><button className="icon" aria-label="旋转页面" onClick={() => setRotation(r => (r + 90) % 360)}><ArrowClockwise/></button><i className="separator"/><button className={bilingual ? 'active' : ''} aria-label="切换原文译文对照" title={documentLanguage === 'zh' ? '中文文献无需翻译' : '原文译文对照'} disabled={documentLanguage === 'zh'} onClick={()=>setBilingual(value=>!value)}><Translate/>{documentLanguage === 'zh' ? '中文原文' : '对照翻译'}</button><button aria-label="切换连续阅读" onClick={()=>setMode(value=>value==='single'?'continuous':'single')}>{mode==='single'?'连续阅读':'单页阅读'}</button>{[['select', Cursor, '选择文字'], ['highlight', Highlighter, '高亮'], ['underline', TextUnderline, '下划线'], ['area', Selection, '区域批注']].map(([key, Icon, label]: any) => <button className={'icon ' + (tool === key ? 'active' : '')} title={label} aria-label={label} key={key} onMouseDown={e => e.preventDefault()} onClick={() => {setTool(key); if (selection && (key === 'highlight' || key === 'underline')) addAnnotation(key);}}><Icon/></button>)}<input className="color-input" aria-label="批注颜色" type="color" value={color} onChange={e => setColor(e.target.value)}/><span className="spacer"/><button className={'icon ' + (rightPanel === 'assistant' ? 'active' : '')} aria-label="打开辅助阅读" title="辅助阅读" onClick={() => {setBilingual(false); setRightPanel('assistant'); setAnnotationsCollapsed(false);}}><Sparkle/></button><button className="icon" aria-label="收起或展开批注侧栏" onClick={()=>{setBilingual(false); setRightPanel('annotations'); setAnnotationsCollapsed(v=>!v);}}><Notebook/></button><button onClick={() => files('annotatedPDF', {id: attachmentId}).then(r => r && notify('已导出带批注的 PDF 副本')).catch(fail)}><DownloadSimple/>导出批注</button></div>
   {record?.text_status==='no_text'&&<div className="reader-ocr-notice">此 PDF 没有可索引的文字层。可以阅读和做区域批注；OCR 与图表识别尚未启用，全文检索和问答不会假装读到页面文字。</div>}
   {error ? <ErrorBox message={error}/> : loading ? <Busy text="正在打开 PDF…"/> : <div className={"reader-body " + (bilingual ? "bilingual" : "")} ref={readerBody}>{selection?.quote?.trim() && <div className="reader-selection-actions" ref={selectionActions} style={{left: selectionPosition?.left, top: selectionPosition?.top, visibility: selectionPosition?.visible ? "visible" : "hidden"}} role="toolbar" aria-label="所选文字操作"><span>已选 {String(selection.quote).trim().length} 字</span><button aria-label="高亮所选文字" onMouseDown={e => e.preventDefault()} onClick={() => addAnnotation('highlight')}><Highlighter/>高亮</button><button aria-label="下划线标记所选文字" onMouseDown={e => e.preventDefault()} onClick={() => addAnnotation('underline')}><TextUnderline/>下划线</button><button aria-label="批注所选文字" onMouseDown={e => e.preventDefault()} onClick={() => {setAnnotationDraft(selection); setAnnotationComment('');}}><Notebook/>批注</button><button aria-label="将所选文字写入笔记" onMouseDown={e => e.preventDefault()} onClick={() => startSelectedNote()}><Notebook/>写笔记</button><button aria-label="清除文字选择" onMouseDown={e => e.preventDefault()} onClick={() => {setSelection(null); window.getSelection()?.removeAllRanges();}}>×</button></div>}<aside className={"reader-nav "+(navCollapsed?"collapsed":"")}><div className="reader-nav-tabs"><button aria-label="缩略图" className={left === 'thumb' ? 'active' : ''} onClick={() => setLeft('thumb')}><SquaresFour/></button><button aria-label="文档目录" className={left === 'outline' ? 'active' : ''} onClick={() => setLeft('outline')}><List/></button><button aria-label="文内搜索" className={left === 'search' ? 'active' : ''} onClick={() => setLeft('search')}><MagnifyingGlass/></button></div><div className="reader-nav-content">{left === 'thumb' && pdf && Array.from({length: pdf.numPages}, (_, n) => <Thumbnail key={n} pdf={pdf} page={n + 1} active={page === n + 1} click={() => goPage(n + 1)}/>)}{left === 'outline' && (outline.length ? outlineNodes(outline) : <p className="muted">此文档没有目录。</p>)}{left === 'search' && <><input aria-label="文内关键词" value={search} onChange={e => setSearch(e.target.value)} placeholder="查找文内文字" onKeyDown={e => e.key === 'Enter' && find()}/><button className="search-pdf" disabled={searching} onClick={find}>{searching ? '搜索中…' : '搜索全文'}</button><small className="muted">找到 {matches.length} 个匹配页面</small>{matches.map(m => <button key={m.page} className="search-result" onClick={() => goPage(m.page)}><strong>第 {m.page} 页</strong><p>{m.snippet}</p></button>)}</>}</div></aside>
   <div className={'pdf-scroll' + (mode === 'continuous' && bilingual ? ' bilingual-flow' : '')} ref={pdfScroll} onWheel={handlePdfWheel} onScroll={handleContinuousScroll}>
@@ -312,7 +329,7 @@ export function Reader({attachmentId, jumpPage, jumpAnnotation, stamp, notify, f
     </> : <>
       {Array.from({length: pdf.numPages}, (_, n) => <ContinuousPage key={n} pdf={pdf} page={n + 1} scale={scale}
         rotation={rotation} annotations={annotations} activeId={active?.id} tool={tool} onSelect={handleContinuousSelect} onStartSelection={() => setSelection(null)}/>)}
-    </> : <><div className="pdf-paper" ref={paper} style={{width: viewport?.width, height: viewport?.height, cursor: tool === 'area' ? 'crosshair' : 'text'}} onMouseDown={e => {if (tool !== 'area') {selectionStart.current = {x: e.clientX, y: e.clientY}; setSelection(null);}}} onMouseUp={captureSelection}><canvas ref={canvas}/><div className="textLayer" ref={text} style={{pointerEvents: tool === 'area' ? 'none' : 'auto'}}/>
+    </> : <><div className="pdf-paper" ref={paper} style={{width: viewport?.width, height: viewport?.height, cursor: tool === 'area' ? 'crosshair' : 'text'}} onMouseDown={e => {if (tool !== 'area') {selectionStart.current = {x: e.clientX, y: e.clientY}; setSelection(null); if (text.current && paper.current) trackPdfSelectionDrag(text.current, paper.current, event => captureRef.current(event));}}}><canvas ref={canvas}/><div className="textLayer" ref={text} style={{pointerEvents: tool === 'area' ? 'none' : 'auto'}}/>
     <div className="annotation-layer">{annotations.filter(a => a.pageIndex === page - 1 && !a.stale).flatMap(a => a.rects.map((r: number[], i: number) => <div key={a.id + i} className={'annotation-mark ' + a.type + (active?.id === a.id ? ' focused' : '')} style={{...renderRect(r), backgroundColor: a.type === 'highlight' ? a.color + '66' : 'transparent', borderColor: a.color}}/>))}</div>
     {tool === 'area' && <div className="area-capture" onPointerDown={e => {const b = e.currentTarget.getBoundingClientRect(); start.current = [e.clientX - b.left, e.clientY - b.top]; e.currentTarget.setPointerCapture(e.pointerId);}} onPointerMove={e => {if (!start.current) return; const b = e.currentTarget.getBoundingClientRect(); setArea([...start.current, e.clientX - b.left, e.clientY - b.top]);}} onPointerUp={e => {if (!start.current || !viewport) return; const b = e.currentTarget.getBoundingClientRect(), end = [e.clientX - b.left, e.clientY - b.top]; if (Math.abs(end[0] - start.current[0]) > 4 && Math.abs(end[1] - start.current[1]) > 4) {const a = viewport.convertToPdfPoint(...start.current), z = viewport.convertToPdfPoint(...end); addAnnotation('area', {rects: [[...a, ...z]], quote: ''});} start.current = null; setArea(null);}}>{area && <div className="area-preview" style={{left: Math.min(area[0], area[2]), top: Math.min(area[1], area[3]), width: Math.abs(area[2] - area[0]), height: Math.abs(area[3] - area[1])}}/>}</div>}
     {rendering && <div className="render-indicator">正在渲染…</div>}</div><div className="paper-caption">第 {page} 页 · {record?.name}</div></>}</div>

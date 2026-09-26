@@ -120,7 +120,7 @@ def capture(library, fulltext, payload):
     raw = payload.get('data')
     require(isinstance(raw, dict), '浏览器题录格式不正确')
     allowed = {'type', 'title', 'author', 'year', 'issued', 'DOI', 'URL', 'container-title',
-               'abstract', 'publisher', 'volume', 'issue', 'page', 'ISSN', 'PMID', 'tags'}
+               'abstract', 'publisher', 'volume', 'issue', 'page', 'ISSN', 'ISBN', 'PMID', 'tags'}
     cleaned = {key: value for key, value in raw.items() if key in allowed}
     if isinstance(cleaned.get('author'), list):
         cleaned['author'] = [author_name(value) if isinstance(value, str) else value for value in cleaned['author']]
@@ -270,6 +270,10 @@ def import_downloaded(library, fulltext, payload):
     job = None
     if fmt == 'pdf' and not added.get('duplicate'):
         job = fulltext.jobs.create('pdf.index', {'attachmentId': added['id']})
+    elif fmt == 'caj' and 'caj.convert' in fulltext.jobs.handlers:
+        with fulltext.downloads.attachments.path(added['id']).open('rb') as caj_file:
+            if caj_file.read(4) == b'KDH ':
+                job = fulltext.jobs.create('caj.convert', {'id': added['id']})
     with library.db(True) as db:
         if not added.get('duplicate'):
             display_name = re.sub(r'-[0-9a-f]{12}(?=\.[^.]+$)', '', path.name) if ticket else path.name
@@ -288,4 +292,5 @@ def import_downloaded(library, fulltext, payload):
     return {'itemId': item_id, 'attachmentId': added['id'], 'duplicate': bool(added.get('duplicate')),
             'format': fmt, 'indexJobId': job['jobId'] if job else None,
             'message': ('PDF 已导入，正在解析并建立全文索引' if fmt == 'pdf' and job else
-                        'PDF 已在文献库中' if fmt == 'pdf' else 'CAJ 原件已保存；当前版本暂不支持 CAJ 全文解析，请在知网导出 PDF 后再索引')}
+                        'PDF 已在文献库中' if fmt == 'pdf' else
+                        'CAJ 原件已保存，正在转换为可阅读的 PDF' if job else 'CAJ 原件已保存；此文件格式暂不能自动转换')}

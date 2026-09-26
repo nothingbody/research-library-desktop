@@ -1,6 +1,6 @@
 {
   "name": "research-library-desktop",
-  "version": "0.9.35",
+  "version": "0.9.45",
   "private": true,
   "description": "Local-first research reference manager",
   "author": "Research Library",
@@ -40,7 +40,9 @@
     "protocols": [
       {
         "name": "文献工作台",
-        "schemes": ["researchlibrary"]
+        "schemes": [
+          "researchlibrary"
+        ]
       }
     ],
     "directories": {

@@ -6,3 +6,8 @@
 .reader-selection-actions button svg{width:15px;height:15px}
 .reader-selection-quote{max-height:130px;overflow:auto;padding:12px;border-left:3px solid #8fa9e7;background:#f6f8fc;color:#40516d;white-space:pre-wrap}
 .reader-selection-note{display:block;width:100%;min-height:220px;margin-top:8px;resize:vertical}
+
+/* Opaque selection prevents overlapping PDF text runs from stacking darker
+   patches. Multiply keeps the underlying page text readable. */
+.reader .pdf-paper .textLayer,.reader .continuous-page .textLayer{mix-blend-mode:multiply}
+.reader .pdf-paper .textLayer ::selection,.reader .continuous-page .textLayer ::selection{background:#cfdcf8}
